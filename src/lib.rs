@@ -19,7 +19,7 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Signal<'a> {
     Kill,
     Link {
@@ -161,31 +161,37 @@ impl PostOffice {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Address {
     pub handle: usize,
     pub generation: u32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Capability {
     pub address: Address,
     pub perms: Permissions,
 }
 
+#[derive(Debug)]
 struct TableEntry {
     cap: Capability,
     refs: usize,
 }
 
-pub struct Table<'a> {
-    post: &'a PostOffice,
+pub struct Table {
+    post: Arc<PostOffice>,
     entries: Slab<TableEntry>,
     reverse_entries: HashMap<Capability, usize>,
 }
 
-impl<'a> Table<'a> {
-    pub(crate) fn new(post: &'a PostOffice) -> RefCell<Self> {
+impl Table {
+    pub fn new() -> RefCell<Self> {
+        let post = PostOffice::new();
+        Self::new_in(post)
+    }
+
+    pub(crate) fn new_in(post: Arc<PostOffice>) -> RefCell<Self> {
         RefCell::new(Self {
             post,
             entries: Slab::new(),
@@ -227,7 +233,7 @@ impl<'a> Table<'a> {
 }
 
 pub struct TableAddress<'a> {
-    table: &'a RefCell<Table<'a>>,
+    table: &'a RefCell<Table>,
     handle: usize,
 }
 
@@ -249,10 +255,30 @@ impl<'a> Drop for TableAddress<'a> {
 }
 
 impl<'a> TableAddress<'a> {
+    pub fn demote(&self, perms: Permissions) -> Self {
+        let mut table = self.table.borrow_mut();
+        let entry = table.entries.get(self.handle).unwrap();
+        let address = entry.cap.address;
+        let handle = table.insert(Capability { address, perms });
+
+        Self {
+            table: self.table,
+            handle,
+        }
+    }
+
     pub(crate) fn signal(&self, signal: Signal) {
         let table = self.table.borrow();
         let entry = table.entries.get(self.handle).unwrap();
         table.post.send(&entry.cap.address, signal);
+    }
+
+    pub fn link(&self, mailbox: &Mailbox<'a>) {
+        assert_eq!(mailbox.linked.table.as_ptr(), self.table.as_ptr());
+
+        self.signal(Signal::Link {
+            address: mailbox.address,
+        });
     }
 
     pub fn send(&self, data: &[u8], caps: &[&TableAddress]) {
@@ -265,22 +291,25 @@ impl<'a> TableAddress<'a> {
 }
 
 pub struct LinkTable<'a> {
-    table: &'a RefCell<Table<'a>>,
+    address: Address,
+    table: &'a RefCell<Table>,
     linked: HashSet<Address>,
 }
 
 impl<'a> Drop for LinkTable<'a> {
     fn drop(&mut self) {
         let table = self.table.borrow();
+        let address = self.address;
         for link in self.linked.drain() {
-            table.post.send(&link, Signal::Unlink { address: link });
+            table.post.send(&link, Signal::Unlink { address });
         }
     }
 }
 
 impl<'a> LinkTable<'a> {
-    pub(crate) fn new(table: &'a RefCell<Table<'a>>) -> Self {
+    pub(crate) fn new(table: &'a RefCell<Table>, address: Address) -> Self {
         Self {
+            address,
             table,
             linked: HashSet::new(),
         }
@@ -293,7 +322,12 @@ impl<'a> LinkTable<'a> {
                 self.linked.insert(address);
                 return Err(true);
             }
-            Signal::Unlink { address } => ContextSignal::Unlink { handle: 0 },
+            Signal::Unlink { address } => ContextSignal::Unlink {
+                handle: self.table.borrow_mut().insert(Capability {
+                    address,
+                    perms: Permissions::empty(),
+                }),
+            },
             Signal::Message { data, caps } => ContextSignal::Message {
                 data,
                 caps: self.map_caps(caps),
@@ -315,14 +349,21 @@ pub struct Mailbox<'a> {
     rx: Receiver<OwnedSignal>,
 }
 
+impl<'a> Drop for Mailbox<'a> {
+    fn drop(&mut self) {
+        // flush and process messages
+        while let Some(Some(_)) = self.try_recv(|_| ()) {}
+    }
+}
+
 impl<'a> Mailbox<'a> {
-    pub fn new(table: &'a RefCell<Table<'a>>) -> Self {
+    pub fn new(table: &'a RefCell<Table>) -> Self {
         let (tx, rx) = channel();
         let address = table.borrow().post.insert(tx);
 
         Self {
             address,
-            linked: LinkTable::new(table),
+            linked: LinkTable::new(table, address),
             rx,
         }
     }
@@ -376,8 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_message() {
-        let post = PostOffice::new();
-        let table = Table::new(post.as_ref());
+        let table = Table::new();
         let mut mb = Mailbox::new(&table);
         let ad = mb.make_address(Permissions::SEND);
         ad.send(b"Hello world!", &[]);
@@ -395,8 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_address() {
-        let post = PostOffice::new();
-        let table = Table::new(post.as_ref());
+        let table = Table::new();
         let mut mb = Mailbox::new(&table);
         let ad = mb.make_address(Permissions::SEND);
         ad.send(b"", &[&ad]);
@@ -414,8 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill() {
-        let post = PostOffice::new();
-        let table = Table::new(post.as_ref());
+        let table = Table::new();
         let mut mb = Mailbox::new(&table);
         let ad = mb.make_address(Permissions::KILL);
         ad.kill();
@@ -424,12 +462,53 @@ mod tests {
 
     #[tokio::test]
     async fn kill_all_mailboxes() {
-        let post = PostOffice::new();
-        let table = Table::new(post.as_ref());
+        let table = Table::new();
         let mb1 = Mailbox::new(&table);
         let mut mb2 = Mailbox::new(&table);
         let ad = mb1.make_address(Permissions::KILL);
         ad.kill();
         assert_eq!(mb2.try_recv(|s| format!("{:?}", s)), None);
+    }
+
+    #[tokio::test]
+    async fn unlink_on_kill() {
+        todo!();
+    }
+
+    #[tokio::test]
+    async fn unlink_on_close() {
+        let table = Table::new();
+        let s_mb = Mailbox::new(&table);
+        let s_cap = s_mb.make_address(Permissions::LINK);
+        let mut object = Mailbox::new(&table);
+        s_cap.link(&object);
+        drop(s_mb);
+
+        let expected = ContextSignal::Unlink {
+            handle: s_cap.demote(Permissions::empty()).handle,
+        };
+
+        object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unlink_dead() {
+        todo!();
+    }
+
+    #[tokio::test]
+    async fn unlink_closed() {
+        let table = Table::new();
+        let s_mb = Mailbox::new(&table);
+        let s_cap = s_mb.make_address(Permissions::LINK);
+        let mut object = Mailbox::new(&table);
+        drop(s_mb);
+        s_cap.link(&object);
+
+        let expected = ContextSignal::Unlink {
+            handle: s_cap.demote(Permissions::empty()).handle,
+        };
+
+        object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
     }
 }

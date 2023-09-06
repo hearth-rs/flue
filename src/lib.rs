@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use sharded_slab::Slab as ShardedSlab;
+use sharded_slab::{Clear, Pool};
 use slab::Slab;
 use zerocopy::{channel, NonOwningMessage, OwningMessage, Receiver, Sender};
 
@@ -19,11 +19,19 @@ bitflags::bitflags! {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Signal<'a> {
     Kill,
-    Link { handle: usize },
-    Unlink { handle: usize },
-    Message { data: &'a [u8], caps: &'a [usize] },
+    Link {
+        address: Address,
+    },
+    Unlink {
+        address: Address,
+    },
+    Message {
+        data: &'a [u8],
+        caps: &'a [Capability],
+    },
 }
 
 impl<'a> NonOwningMessage<'a> for Signal<'a> {
@@ -32,8 +40,8 @@ impl<'a> NonOwningMessage<'a> for Signal<'a> {
     fn to_owned(self) -> OwnedSignal {
         match self {
             Signal::Kill => OwnedSignal::Kill,
-            Signal::Link { handle } => OwnedSignal::Link { handle },
-            Signal::Unlink { handle } => OwnedSignal::Unlink { handle },
+            Signal::Link { address } => OwnedSignal::Link { address },
+            Signal::Unlink { address } => OwnedSignal::Unlink { address },
             Signal::Message { data, caps } => OwnedSignal::Message {
                 data: data.to_vec(),
                 caps: caps.to_vec(),
@@ -44,9 +52,16 @@ impl<'a> NonOwningMessage<'a> for Signal<'a> {
 
 enum OwnedSignal {
     Kill,
-    Link { handle: usize },
-    Unlink { handle: usize },
-    Message { data: Vec<u8>, caps: Vec<usize> },
+    Link {
+        address: Address,
+    },
+    Unlink {
+        address: Address,
+    },
+    Message {
+        data: Vec<u8>,
+        caps: Vec<Capability>,
+    },
 }
 
 impl OwningMessage for OwnedSignal {
@@ -55,8 +70,8 @@ impl OwningMessage for OwnedSignal {
     fn to_non_owned(&self) -> Self::NonOwning<'_> {
         match self {
             OwnedSignal::Kill => Signal::Kill,
-            OwnedSignal::Link { handle } => Signal::Link { handle: *handle },
-            OwnedSignal::Unlink { handle } => Signal::Unlink { handle: *handle },
+            OwnedSignal::Link { address } => Signal::Link { address: *address },
+            OwnedSignal::Unlink { address } => Signal::Unlink { address: *address },
             OwnedSignal::Message { data, caps } => Signal::Message {
                 data: data.as_slice(),
                 caps: caps.as_slice(),
@@ -72,64 +87,101 @@ pub enum ContextSignal<'a> {
 }
 
 struct Route {
-    tx: Sender<OwnedSignal>,
+    tx: Option<Sender<OwnedSignal>>,
+    generation: u32,
+}
+
+impl Default for Route {
+    fn default() -> Self {
+        Self {
+            tx: None,
+            generation: 0,
+        }
+    }
+}
+
+impl Clear for Route {
+    fn clear(&mut self) {
+        self.tx.take();
+        self.generation += 1;
+    }
 }
 
 pub struct PostOffice {
-    routes: ShardedSlab<Route>,
+    routes: Pool<Route>,
 }
 
 impl PostOffice {
-    pub fn new() -> Self {
-        Self {
-            routes: ShardedSlab::new(),
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            routes: Pool::new(),
+        })
+    }
+
+    pub(crate) fn insert(&self, tx: Sender<OwnedSignal>) -> Address {
+        let mut route = self.routes.create().unwrap();
+        route.tx = Some(tx);
+
+        Address {
+            handle: route.key(),
+            generation: route.generation,
         }
     }
 
-    pub(crate) fn insert(&self, route: Route) -> usize {
-        self.routes.insert(route).unwrap()
-    }
+    pub(crate) fn send(&self, address: &Address, signal: Signal) {
+        let route = self.routes.get(address.handle).unwrap();
 
-    pub(crate) fn send(&self, handle: usize, signal: Signal) {
-        let _ = self.routes.get(handle).unwrap().tx.send(signal);
+        // shorthand to immediately unlink
+        let unlink = move || {
+            if let Signal::Link { address: reply } = signal {
+                self.send(&reply, Signal::Unlink { address: *address });
+            }
+        };
+
+        // check that generation is valid
+        if route.generation != address.generation {
+            unlink();
+            return;
+        }
+
+        // fetch sender, if available
+        let Some(tx) = &route.tx else {
+            unlink();
+            return;
+        };
+
+        // send signal
+        let result = tx.send(signal);
+
+        // clear this route if the receiver was dropped
+        if result.is_err() {
+            unlink();
+            self.routes.clear(address.handle);
+        }
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Address {
     pub handle: usize,
+    pub generation: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct Capability {
+    pub address: Address,
     pub perms: Permissions,
 }
 
-#[derive(Clone, Copy)]
-pub struct AddressRef<'a> {
-    post: &'a Arc<PostOffice>,
-    inner: Address,
-}
-
-pub struct AddressOwned {
-    post: Arc<PostOffice>,
-    inner: Address,
-}
-
-impl AddressOwned {
-    pub fn as_ref(&self) -> AddressRef<'_> {
-        AddressRef {
-            post: &self.post,
-            inner: self.inner,
-        }
-    }
-}
-
 struct TableEntry {
-    address: Address,
+    cap: Capability,
     refs: usize,
 }
 
 pub struct Table<'a> {
     post: &'a PostOffice,
     entries: Slab<TableEntry>,
-    reverse_entries: HashMap<Address, usize>,
+    reverse_entries: HashMap<Capability, usize>,
 }
 
 impl<'a> Table<'a> {
@@ -141,9 +193,9 @@ impl<'a> Table<'a> {
         })
     }
 
-    pub(crate) fn insert(&mut self, address: Address) -> usize {
+    pub(crate) fn insert(&mut self, cap: Capability) -> usize {
         use std::collections::hash_map::Entry;
-        let entry = self.reverse_entries.entry(address);
+        let entry = self.reverse_entries.entry(cap);
         match entry {
             Entry::Occupied(handle) => {
                 let handle = *handle.get();
@@ -152,7 +204,7 @@ impl<'a> Table<'a> {
             }
             Entry::Vacant(reverse_entry) => {
                 let refs = 1;
-                let entry = TableEntry { address, refs };
+                let entry = TableEntry { cap, refs };
                 let handle = self.entries.insert(entry);
                 reverse_entry.insert(handle);
                 handle
@@ -200,10 +252,10 @@ impl<'a> TableAddress<'a> {
     pub(crate) fn signal(&self, signal: Signal) {
         let table = self.table.borrow();
         let entry = table.entries.get(self.handle).unwrap();
-        table.post.send(entry.address.handle, signal);
+        table.post.send(&entry.cap.address, signal);
     }
 
-    pub fn send(&self, data: &[u8], _caps: &[&TableAddress]) {
+    pub fn send(&self, data: &[u8], caps: &[&TableAddress]) {
         self.signal(Signal::Message { data, caps: &[] });
     }
 
@@ -213,29 +265,22 @@ impl<'a> TableAddress<'a> {
 }
 
 pub struct LinkTable<'a> {
-    handle: usize,
     table: &'a RefCell<Table<'a>>,
-    linked: HashSet<usize>,
+    linked: HashSet<Address>,
 }
 
 impl<'a> Drop for LinkTable<'a> {
     fn drop(&mut self) {
         let table = self.table.borrow();
         for link in self.linked.drain() {
-            table.post.send(
-                link,
-                Signal::Unlink {
-                    handle: self.handle,
-                },
-            );
+            table.post.send(&link, Signal::Unlink { address: link });
         }
     }
 }
 
 impl<'a> LinkTable<'a> {
-    pub(crate) fn new(table: &'a RefCell<Table<'a>>, handle: usize) -> Self {
+    pub(crate) fn new(table: &'a RefCell<Table<'a>>) -> Self {
         Self {
-            handle,
             table,
             linked: HashSet::new(),
         }
@@ -244,11 +289,11 @@ impl<'a> LinkTable<'a> {
     pub(crate) fn on_signal<'s>(&mut self, signal: Signal<'s>) -> Result<ContextSignal<'s>, bool> {
         let ctx_signal = match signal {
             Signal::Kill => return Err(false),
-            Signal::Link { handle } => {
-                self.linked.insert(handle);
+            Signal::Link { address } => {
+                self.linked.insert(address);
                 return Err(true);
             }
-            Signal::Unlink { handle } => ContextSignal::Unlink { handle },
+            Signal::Unlink { address } => ContextSignal::Unlink { handle: 0 },
             Signal::Message { data, caps } => ContextSignal::Message {
                 data,
                 caps: self.map_caps(caps),
@@ -258,22 +303,14 @@ impl<'a> LinkTable<'a> {
         Ok(ctx_signal)
     }
 
-    pub(crate) fn map_caps(&self, caps: &[usize]) -> Vec<usize> {
+    pub(crate) fn map_caps(&self, caps: &[Capability]) -> Vec<usize> {
         let mut table = self.table.borrow_mut();
-
-        caps.iter()
-            .map(|cap| {
-                table.insert(Address {
-                    handle: *cap,
-                    perms: Permissions::empty(),
-                })
-            })
-            .collect()
+        caps.iter().map(|cap| table.insert(*cap)).collect()
     }
 }
 
 pub struct Mailbox<'a> {
-    handle: usize,
+    address: Address,
     linked: LinkTable<'a>,
     rx: Receiver<OwnedSignal>,
 }
@@ -281,12 +318,11 @@ pub struct Mailbox<'a> {
 impl<'a> Mailbox<'a> {
     pub fn new(table: &'a RefCell<Table<'a>>) -> Self {
         let (tx, rx) = channel();
-        let route = Route { tx };
-        let handle = table.borrow().post.insert(route);
+        let address = table.borrow().post.insert(tx);
 
         Self {
-            handle,
-            linked: LinkTable::new(table, handle),
+            address,
+            linked: LinkTable::new(table),
             rx,
         }
     }
@@ -322,8 +358,8 @@ impl<'a> Mailbox<'a> {
     }
 
     pub fn make_address(&self, perms: Permissions) -> TableAddress<'a> {
-        let handle = self.linked.table.borrow_mut().insert(Address {
-            handle: self.handle,
+        let handle = self.linked.table.borrow_mut().insert(Capability {
+            address: self.address,
             perms,
         });
 
@@ -340,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_message() {
-        let post = Arc::new(PostOffice::new());
+        let post = PostOffice::new();
         let table = Table::new(post.as_ref());
         let mut mb = Mailbox::new(&table);
         let ad = mb.make_address(Permissions::SEND);
@@ -359,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_address() {
-        let post = Arc::new(PostOffice::new());
+        let post = PostOffice::new();
         let table = Table::new(post.as_ref());
         let mut mb = Mailbox::new(&table);
         let ad = mb.make_address(Permissions::SEND);
@@ -378,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill() {
-        let post = Arc::new(PostOffice::new());
+        let post = PostOffice::new();
         let table = Table::new(post.as_ref());
         let mut mb = Mailbox::new(&table);
         let ad = mb.make_address(Permissions::KILL);
@@ -388,7 +424,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_all_mailboxes() {
-        let post = Arc::new(PostOffice::new());
+        let post = PostOffice::new();
         let table = Table::new(post.as_ref());
         let mb1 = Mailbox::new(&table);
         let mut mb2 = Mailbox::new(&table);

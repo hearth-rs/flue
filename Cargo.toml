@@ -1,0 +1,13 @@
+[package]
+name = "flue"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitflags = "2.4.0"
+flume = "0.11.0"
+sharded-slab = "0.1.4"
+slab = "0.4.9"
+
+[dev-dependencies]
+tokio = { version = "1.32.0", features = ["macros", "rt"] }

@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use parking_lot::Mutex;
 use sharded_slab::{Clear, Pool};
 use slab::Slab;
 use zerocopy::{channel, NonOwningMessage, OwningMessage, Receiver, Sender};
@@ -88,6 +89,7 @@ pub enum ContextSignal<'a> {
 
 struct Route {
     tx: Option<Sender<OwnedSignal>>,
+    links: Mutex<HashSet<Address>>,
     generation: u32,
 }
 
@@ -95,6 +97,7 @@ impl Default for Route {
     fn default() -> Self {
         Self {
             tx: None,
+            links: Mutex::new(HashSet::new()),
             generation: 0,
         }
     }
@@ -103,6 +106,7 @@ impl Default for Route {
 impl Clear for Route {
     fn clear(&mut self) {
         self.tx.take();
+        self.links.lock().clear();
         self.generation += 1;
     }
 }
@@ -191,6 +195,10 @@ impl Table {
         Self::new_in(post)
     }
 
+    pub fn spawn(&self) -> RefCell<Self> {
+        Self::new_in(self.post.clone())
+    }
+
     pub(crate) fn new_in(post: Arc<PostOffice>) -> RefCell<Self> {
         RefCell::new(Self {
             post,
@@ -216,6 +224,16 @@ impl Table {
                 handle
             }
         }
+    }
+
+    pub fn import<'a>(&mut self, mailbox: &Mailbox<'a>, perms: Permissions) -> usize {
+        let other = mailbox.linked.table.borrow();
+        assert_eq!(Arc::as_ptr(&self.post), Arc::as_ptr(&other.post));
+
+        self.insert(Capability {
+            address: mailbox.address,
+            perms,
+        })
     }
 
     pub fn inc_ref(&mut self, handle: usize) {
@@ -472,7 +490,29 @@ mod tests {
 
     #[tokio::test]
     async fn unlink_on_kill() {
-        todo!();
+        let table = Table::new();
+        let mut object = Mailbox::new(&table);
+
+        let child = table.borrow().spawn();
+        let s_mb = Mailbox::new(&child);
+
+        let s_handle = table
+            .borrow_mut()
+            .import(&s_mb, Permissions::LINK | Permissions::KILL);
+
+        let s_cap = TableAddress {
+            table: &table,
+            handle: s_handle,
+        };
+
+        s_cap.link(&object);
+        s_cap.kill();
+
+        let expected = ContextSignal::Unlink {
+            handle: s_cap.demote(Permissions::empty()).handle,
+        };
+
+        object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
     }
 
     #[tokio::test]

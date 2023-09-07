@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 bitflags = "2.4.0"
 flume = "0.11.0"
+parking_lot = "0.12.1"
 sharded-slab = "0.1.4"
 slab = "0.4.9"
 

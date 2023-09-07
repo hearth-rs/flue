@@ -474,7 +474,7 @@ mod tests {
         let mut mb2 = Mailbox::new(&table);
         let ad = mb1.make_address(Permissions::KILL);
         ad.kill();
-        assert_eq!(mb2.try_recv(|s| format!("{:?}", s)), None);
+        assert_eq!(mb2.recv(|s| format!("{:?}", s)).await, None);
     }
 
     #[tokio::test]
@@ -522,7 +522,29 @@ mod tests {
 
     #[tokio::test]
     async fn unlink_dead() {
-        todo!();
+        let table = Table::new();
+        let mut object = Mailbox::new(&table);
+
+        let child = table.borrow().spawn();
+        let s_mb = Mailbox::new(&child);
+
+        let s_handle = table
+            .borrow_mut()
+            .import(&s_mb, Permissions::LINK | Permissions::KILL);
+
+        let s_cap = TableAddress {
+            table: &table,
+            handle: s_handle,
+        };
+
+        s_cap.kill();
+        s_cap.link(&object);
+
+        let expected = ContextSignal::Unlink {
+            handle: s_cap.demote(Permissions::empty()).handle,
+        };
+
+        object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
     }
 
     #[tokio::test]

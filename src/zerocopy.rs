@@ -22,6 +22,10 @@ where
         let owned = data.to_owned();
         self.inner_tx.send(owned)
     }
+
+    pub fn receiver_count(&self) -> usize {
+        self.inner_tx.receiver_count()
+    }
 }
 
 pub struct Receiver<T> {
@@ -50,6 +54,10 @@ where
         let non_owning = owning.to_non_owned();
         let result = f(non_owning);
         Ok(result)
+    }
+
+    pub fn sender_count(&self) -> usize {
+        self.inner_rx.sender_count()
     }
 }
 

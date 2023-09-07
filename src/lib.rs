@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    ops::Deref,
     sync::Arc,
 };
 
@@ -22,10 +23,6 @@ bitflags::bitflags! {
 
 #[derive(Clone, Copy, Debug)]
 enum Signal<'a> {
-    Kill,
-    Link {
-        address: Address,
-    },
     Unlink {
         address: Address,
     },
@@ -40,8 +37,6 @@ impl<'a> NonOwningMessage<'a> for Signal<'a> {
 
     fn to_owned(self) -> OwnedSignal {
         match self {
-            Signal::Kill => OwnedSignal::Kill,
-            Signal::Link { address } => OwnedSignal::Link { address },
             Signal::Unlink { address } => OwnedSignal::Unlink { address },
             Signal::Message { data, caps } => OwnedSignal::Message {
                 data: data.to_vec(),
@@ -52,10 +47,6 @@ impl<'a> NonOwningMessage<'a> for Signal<'a> {
 }
 
 enum OwnedSignal {
-    Kill,
-    Link {
-        address: Address,
-    },
     Unlink {
         address: Address,
     },
@@ -70,8 +61,6 @@ impl OwningMessage for OwnedSignal {
 
     fn to_non_owned(&self) -> Self::NonOwning<'_> {
         match self {
-            OwnedSignal::Kill => Signal::Kill,
-            OwnedSignal::Link { address } => Signal::Link { address: *address },
             OwnedSignal::Unlink { address } => Signal::Unlink { address: *address },
             OwnedSignal::Message { data, caps } => Signal::Message {
                 data: data.as_slice(),
@@ -132,35 +121,70 @@ impl PostOffice {
         }
     }
 
-    pub(crate) fn send(&self, address: &Address, signal: Signal) {
-        let route = self.routes.get(address.handle).unwrap();
-
-        // shorthand to immediately unlink
-        let unlink = move || {
-            if let Signal::Link { address: reply } = signal {
-                self.send(&reply, Signal::Unlink { address: *address });
-            }
+    pub(crate) fn kill(&self, address: &Address) {
+        let Some(route) = self.get_route(address) else {
+            return;
         };
 
-        // check that generation is valid
-        if route.generation != address.generation {
+        let links = route.links.lock();
+        for link in links.iter() {
+            self.send(&link, Signal::Unlink { address: *address });
+        }
+
+        self.routes.clear(address.handle);
+    }
+
+    pub(crate) fn link(&self, subject: &Address, object: &Address) {
+        // shorthand to immediately unlink
+        let unlink = move || {
+            self.send(&object, Signal::Unlink { address: *subject });
+            self.kill(&subject);
+        };
+
+        let Some(route) = self.get_route(subject) else {
+            unlink();
+            return;
+        };
+
+        let Some(tx) = &route.tx else {
+            unlink();
+            return;
+        };
+
+        if tx.receiver_count() == 0 {
             unlink();
             return;
         }
 
+        route.links.lock().insert(*object);
+    }
+
+    pub(crate) fn send(&self, address: &Address, signal: Signal) {
+        let Some(route) = self.get_route(address) else {
+            return;
+        };
+
         // fetch sender, if available
         let Some(tx) = &route.tx else {
-            unlink();
             return;
         };
 
         // send signal
         let result = tx.send(signal);
 
-        // clear this route if the receiver was dropped
+        // kill this route if the receiver was dropped
         if result.is_err() {
-            unlink();
-            self.routes.clear(address.handle);
+            self.kill(address);
+        }
+    }
+
+    fn get_route(&self, address: &Address) -> Option<impl Deref<Target = Route> + '_> {
+        let route = self.routes.get(address.handle)?;
+
+        if route.generation != address.generation {
+            None
+        } else {
+            Some(route)
         }
     }
 }
@@ -226,8 +250,23 @@ impl Table {
         }
     }
 
+    pub(crate) fn map_signal<'a>(&mut self, signal: Signal<'a>) -> ContextSignal<'a> {
+        match signal {
+            Signal::Unlink { address } => ContextSignal::Unlink {
+                handle: self.insert(Capability {
+                    address,
+                    perms: Permissions::empty(),
+                }),
+            },
+            Signal::Message { data, caps } => ContextSignal::Message {
+                data,
+                caps: caps.iter().map(|cap| self.insert(*cap)).collect(),
+            },
+        }
+    }
+
     pub fn import<'a>(&mut self, mailbox: &Mailbox<'a>, perms: Permissions) -> usize {
-        let other = mailbox.linked.table.borrow();
+        let other = mailbox.table.borrow();
         assert_eq!(Arc::as_ptr(&self.post), Arc::as_ptr(&other.post));
 
         self.insert(Capability {
@@ -292,11 +331,11 @@ impl<'a> TableAddress<'a> {
     }
 
     pub fn link(&self, mailbox: &Mailbox<'a>) {
-        assert_eq!(mailbox.linked.table.as_ptr(), self.table.as_ptr());
+        assert_eq!(mailbox.table.as_ptr(), self.table.as_ptr());
 
-        self.signal(Signal::Link {
-            address: mailbox.address,
-        });
+        let table = self.table.borrow();
+        let entry = table.entries.get(self.handle).unwrap();
+        table.post.link(&entry.cap.address, &mailbox.address);
     }
 
     pub fn send(&self, data: &[u8], caps: &[&TableAddress]) {
@@ -304,73 +343,22 @@ impl<'a> TableAddress<'a> {
     }
 
     pub fn kill(&self) {
-        self.signal(Signal::Kill);
-    }
-}
-
-pub struct LinkTable<'a> {
-    address: Address,
-    table: &'a RefCell<Table>,
-    linked: HashSet<Address>,
-}
-
-impl<'a> Drop for LinkTable<'a> {
-    fn drop(&mut self) {
         let table = self.table.borrow();
-        let address = self.address;
-        for link in self.linked.drain() {
-            table.post.send(&link, Signal::Unlink { address });
-        }
-    }
-}
-
-impl<'a> LinkTable<'a> {
-    pub(crate) fn new(table: &'a RefCell<Table>, address: Address) -> Self {
-        Self {
-            address,
-            table,
-            linked: HashSet::new(),
-        }
-    }
-
-    pub(crate) fn on_signal<'s>(&mut self, signal: Signal<'s>) -> Result<ContextSignal<'s>, bool> {
-        let ctx_signal = match signal {
-            Signal::Kill => return Err(false),
-            Signal::Link { address } => {
-                self.linked.insert(address);
-                return Err(true);
-            }
-            Signal::Unlink { address } => ContextSignal::Unlink {
-                handle: self.table.borrow_mut().insert(Capability {
-                    address,
-                    perms: Permissions::empty(),
-                }),
-            },
-            Signal::Message { data, caps } => ContextSignal::Message {
-                data,
-                caps: self.map_caps(caps),
-            },
-        };
-
-        Ok(ctx_signal)
-    }
-
-    pub(crate) fn map_caps(&self, caps: &[Capability]) -> Vec<usize> {
-        let mut table = self.table.borrow_mut();
-        caps.iter().map(|cap| table.insert(*cap)).collect()
+        let entry = table.entries.get(self.handle).unwrap();
+        table.post.kill(&entry.cap.address);
     }
 }
 
 pub struct Mailbox<'a> {
+    table: &'a RefCell<Table>,
     address: Address,
-    linked: LinkTable<'a>,
     rx: Receiver<OwnedSignal>,
 }
 
 impl<'a> Drop for Mailbox<'a> {
     fn drop(&mut self) {
-        // flush and process messages
-        while let Some(Some(_)) = self.try_recv(|_| ()) {}
+        let table = self.table.borrow();
+        table.post.kill(&self.address);
     }
 }
 
@@ -378,52 +366,42 @@ impl<'a> Mailbox<'a> {
     pub fn new(table: &'a RefCell<Table>) -> Self {
         let (tx, rx) = channel();
         let address = table.borrow().post.insert(tx);
-
-        Self {
-            address,
-            linked: LinkTable::new(table, address),
-            rx,
-        }
+        Self { table, address, rx }
     }
 
     pub async fn recv<T>(&mut self, mut f: impl FnMut(ContextSignal) -> T) -> Option<T> {
-        loop {
-            let (rx, linked) = (&self.rx, &mut self.linked);
-            let result = rx
-                .recv(|signal| linked.on_signal(signal).map(|ctx_signal| f(ctx_signal)))
-                .await;
-
-            match result {
-                Ok(Ok(signal)) => break Some(signal),
-                Ok(Err(false)) => break None,
-                _ => {}
-            }
-        }
+        self.rx
+            .recv(|signal| {
+                let mut table = self.table.borrow_mut();
+                let signal = table.map_signal(signal);
+                f(signal)
+            })
+            .await
+            .ok()
     }
 
     pub fn try_recv<T>(&mut self, mut f: impl FnMut(ContextSignal) -> T) -> Option<Option<T>> {
-        loop {
-            let (rx, linked) = (&self.rx, &mut self.linked);
-            let result =
-                rx.try_recv(|signal| linked.on_signal(signal).map(|ctx_signal| f(ctx_signal)));
+        let result = self.rx.try_recv(|signal| {
+            let mut table = self.table.borrow_mut();
+            let signal = table.map_signal(signal);
+            f(signal)
+        });
 
-            match result {
-                Ok(Ok(signal)) => break Some(Some(signal)),
-                Ok(Err(false)) => break None,
-                Err(_) => break Some(None),
-                _ => {}
-            }
+        match result {
+            Ok(t) => Some(Some(t)),
+            Err(flume::TryRecvError::Empty) => Some(None),
+            Err(flume::TryRecvError::Disconnected) => None,
         }
     }
 
     pub fn make_address(&self, perms: Permissions) -> TableAddress<'a> {
-        let handle = self.linked.table.borrow_mut().insert(Capability {
+        let handle = self.table.borrow_mut().insert(Capability {
             address: self.address,
             perms,
         });
 
         TableAddress {
-            table: self.linked.table,
+            table: self.table,
             handle,
         }
     }

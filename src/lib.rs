@@ -339,7 +339,18 @@ impl<'a> TableAddress<'a> {
     }
 
     pub fn send(&self, data: &[u8], caps: &[&TableAddress]) {
-        self.signal(Signal::Message { data, caps: &[] });
+        let mut mapped_caps = Vec::with_capacity(caps.len());
+        let table = self.table.borrow();
+        for cap in caps.iter() {
+            assert_eq!(cap.table.as_ptr(), self.table.as_ptr());
+            let entry = table.entries.get(cap.handle).unwrap();
+            mapped_caps.push(entry.cap);
+        }
+
+        self.signal(Signal::Message {
+            data,
+            caps: &mapped_caps,
+        });
     }
 
     pub fn kill(&self) {

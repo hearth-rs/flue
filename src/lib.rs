@@ -19,6 +19,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    fmt::Debug,
     ops::Deref,
     sync::Arc,
 };
@@ -403,6 +404,11 @@ impl Table {
         let mut inner = self.inner.borrow_mut();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
         let address = entry.cap.address;
+
+        if !entry.cap.perms.contains(perms) {
+            return Err(TableError::PermissionDenied);
+        }
+
         let handle = inner.insert(Capability { address, perms });
         Ok(handle)
     }
@@ -411,6 +417,11 @@ impl Table {
         assert!(std::ptr::eq(mailbox.store.table, self));
         let inner = self.inner.borrow();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+
+        if !entry.cap.perms.contains(Permissions::LINK) {
+            return Err(TableError::PermissionDenied);
+        }
+
         self.post.link(&entry.cap.address, &mailbox.address);
         Ok(())
     }
@@ -418,6 +429,10 @@ impl Table {
     pub fn send(&self, handle: usize, data: &[u8], caps: &[usize]) -> Result<(), TableError> {
         let inner = self.inner.borrow();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+
+        if !entry.cap.perms.contains(Permissions::SEND) {
+            return Err(TableError::PermissionDenied);
+        }
 
         let mut mapped_caps = Vec::with_capacity(caps.len());
         for cap in caps.iter() {
@@ -439,6 +454,11 @@ impl Table {
     pub fn kill(&self, handle: usize) -> Result<(), TableError> {
         let inner = self.inner.borrow();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+
+        if !entry.cap.perms.contains(Permissions::KILL) {
+            return Err(TableError::PermissionDenied);
+        }
+
         self.post.kill(&entry.cap.address);
         Ok(())
     }
@@ -457,6 +477,14 @@ impl<'a> Clone for CapabilityHandle<'a> {
             table: self.table,
             handle: self.handle,
         }
+    }
+}
+
+impl<'a> Debug for CapabilityHandle<'a> {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        fmt.debug_tuple("CapabilityHandle")
+            .field(&self.handle)
+            .finish()
     }
 }
 
@@ -631,6 +659,46 @@ mod tests {
             })
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn deny_send() {
+        let table = Table::new();
+        let mb_store = MailboxStore::new(&table);
+        let mb = mb_store.create_mailbox().unwrap();
+        let ad = mb.make_capability(Permissions::empty());
+        let result = ad.send(b"", &[]);
+        assert_eq!(result, Err(TableError::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn deny_kill() {
+        let table = Table::new();
+        let mb_store = MailboxStore::new(&table);
+        let mb = mb_store.create_mailbox().unwrap();
+        let ad = mb.make_capability(Permissions::empty());
+        let result = ad.kill();
+        assert_eq!(result, Err(TableError::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn deny_link() {
+        let table = Table::new();
+        let mb_store = MailboxStore::new(&table);
+        let mb = mb_store.create_mailbox().unwrap();
+        let ad = mb.make_capability(Permissions::empty());
+        let result = ad.link(&mb);
+        assert_eq!(result, Err(TableError::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn deny_demote_escalation() {
+        let table = Table::new();
+        let mb_store = MailboxStore::new(&table);
+        let mb = mb_store.create_mailbox().unwrap();
+        let ad = mb.make_capability(Permissions::KILL);
+        let result = ad.demote(Permissions::SEND);
+        assert_eq!(result.unwrap_err(), TableError::PermissionDenied);
     }
 
     #[tokio::test]

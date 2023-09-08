@@ -2,6 +2,9 @@
 name = "flue"
 version = "0.1.0"
 edition = "2021"
+description = "An efficient and secure actor runtime library."
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/hearth-rs/flue"
 
 [dependencies]
 bitflags = "2.4.0"

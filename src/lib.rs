@@ -178,7 +178,7 @@ impl PostOffice {
 
         let links = route.links.lock();
         for link in links.iter() {
-            self.send(&link, Signal::Unlink { address: *address });
+            self.send(link, Signal::Unlink { address: *address });
         }
 
         self.routes.clear(address.handle);
@@ -187,8 +187,8 @@ impl PostOffice {
     pub(crate) fn link(&self, subject: &Address, object: &Address) {
         // shorthand to immediately unlink
         let unlink = move || {
-            self.send(&object, Signal::Unlink { address: *subject });
-            self.close(&subject);
+            self.send(object, Signal::Unlink { address: *subject });
+            self.close(subject);
         };
 
         let Some(route) = self.get_route(subject) else {
@@ -297,20 +297,16 @@ pub struct Table {
     inner: RefCell<TableInner>,
 }
 
-impl Table {
-    /// Creates a new [Table] in **a new [PostOffice]**.
-    pub fn new() -> Self {
+impl Default for Table {
+    fn default() -> Self {
         let post = PostOffice::new();
-        Self::new_in(post)
+        Self::new(post)
     }
+}
 
-    /// Creates a new [Table] in the same [PostOffice].
-    pub fn spawn(&self) -> Self {
-        Self::new_in(self.post.clone())
-    }
-
-    /// Creates a new [Table] in a specific [PostOffice].
-    pub fn new_in(post: Arc<PostOffice>) -> Self {
+impl Table {
+    /// Creates a new [Table] in a [PostOffice].
+    pub fn new(post: Arc<PostOffice>) -> Self {
         Self {
             post,
             inner: RefCell::new(TableInner {
@@ -318,6 +314,11 @@ impl Table {
                 reverse_entries: HashMap::new(),
             }),
         }
+    }
+
+    /// Creates a new [Table] in the same [PostOffice].
+    pub fn spawn(&self) -> Self {
+        Self::new(self.post.clone())
     }
 
     pub(crate) fn insert(&self, cap: Capability) -> usize {
@@ -356,7 +357,7 @@ impl Table {
         })
     }
 
-    pub fn import<'a>(&self, mailbox: &Mailbox<'a>, perms: Permissions) -> usize {
+    pub fn import(&self, mailbox: &Mailbox, perms: Permissions) -> usize {
         assert_eq!(
             Arc::as_ptr(&self.post),
             Arc::as_ptr(&mailbox.store.table.post)
@@ -631,7 +632,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_message() {
-        let table = Table::new();
+        let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mut mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::SEND);
@@ -650,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_address() {
-        let table = Table::new();
+        let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mut mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::SEND);
@@ -669,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_recv() {
-        let table = Table::new();
+        let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mut mb = mb_store.create_mailbox().unwrap();
 
@@ -691,7 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_send() {
-        let table = Table::new();
+        let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::empty());
@@ -701,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_kill() {
-        let table = Table::new();
+        let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::empty());
@@ -711,7 +712,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_link() {
-        let table = Table::new();
+        let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::empty());
@@ -721,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_demote_escalation() {
-        let table = Table::new();
+        let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::KILL);
@@ -731,7 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill() {
-        let table = Table::new();
+        let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mut mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::KILL);
@@ -741,7 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn double_kill() {
-        let table = Table::new();
+        let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mut mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::KILL);
@@ -752,7 +753,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_handles_are_freed() {
-        let table = Table::new();
+        let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::empty());
@@ -764,7 +765,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_all_mailboxes() {
-        let table = Table::new();
+        let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mb1 = mb_store.create_mailbox().unwrap();
         let mut mb2 = mb_store.create_mailbox().unwrap();
@@ -775,7 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlink_on_kill() {
-        let table = Table::new();
+        let table = Table::default();
         let o_store = MailboxStore::new(&table);
         let mut object = o_store.create_mailbox().unwrap();
 
@@ -802,7 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlink_on_close() {
-        let table = Table::new();
+        let table = Table::default();
         let store = MailboxStore::new(&table);
         let s_mb = store.create_mailbox().unwrap();
         let s_cap = s_mb.make_capability(Permissions::LINK);
@@ -819,7 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlink_dead() {
-        let table = Table::new();
+        let table = Table::default();
         let o_store = MailboxStore::new(&table);
         let mut object = o_store.create_mailbox().unwrap();
 
@@ -846,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlink_closed() {
-        let table = Table::new();
+        let table = Table::default();
         let store = MailboxStore::new(&table);
         let s_mb = store.create_mailbox().unwrap();
         let s_cap = s_mb.make_capability(Permissions::LINK);

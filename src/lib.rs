@@ -250,6 +250,15 @@ pub(crate) struct Capability {
     pub perms: Permissions,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TableError {
+    /// A handle used in this table operation was invalid.
+    InvalidHandle,
+
+    /// A handle used in this table operation does not have sufficient permissions.
+    PermissionDenied,
+}
+
 #[derive(Debug)]
 struct TableEntry {
     cap: Capability,
@@ -329,6 +338,18 @@ impl Table {
         }
     }
 
+    /// Wraps a raw capability handle in a Rust-friendly [CapabilityHandle] struct.
+    pub fn wrap_handle(&self, handle: usize) -> Result<CapabilityHandle, TableError> {
+        if !self.inner.borrow().entries.contains(handle) {
+            return Err(TableError::InvalidHandle);
+        }
+
+        Ok(CapabilityHandle {
+            table: self,
+            handle,
+        })
+    }
+
     pub fn import<'a>(&self, mailbox: &Mailbox<'a>, perms: Permissions) -> usize {
         assert_eq!(
             Arc::as_ptr(&self.post),
@@ -341,34 +362,96 @@ impl Table {
         })
     }
 
-    pub fn inc_ref(&self, handle: usize) {
+    pub fn inc_ref(&self, handle: usize) -> Result<(), TableError> {
         self.inner
             .borrow_mut()
             .entries
             .get_mut(handle)
-            .unwrap()
+            .ok_or(TableError::InvalidHandle)?
             .refs += 1;
+
+        Ok(())
     }
 
-    pub fn dec_ref(&self, handle: usize) {
+    pub fn dec_ref(&self, handle: usize) -> Result<(), TableError> {
         let mut inner = self.inner.borrow_mut();
-        let entry = inner.entries.get_mut(handle).unwrap();
+
+        let entry = inner
+            .entries
+            .get_mut(handle)
+            .ok_or(TableError::InvalidHandle)?;
+
         if entry.refs <= 1 {
             entry.refs -= 1;
         } else {
             inner.entries.remove(handle);
         }
+
+        Ok(())
+    }
+
+    pub fn get_permissions(&self, handle: usize) -> Result<Permissions, TableError> {
+        self.inner
+            .borrow()
+            .entries
+            .get(handle)
+            .ok_or(TableError::InvalidHandle)
+            .map(|e| e.cap.perms)
+    }
+
+    pub fn demote(&self, handle: usize, perms: Permissions) -> Result<usize, TableError> {
+        let mut inner = self.inner.borrow_mut();
+        let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+        let address = entry.cap.address;
+        let handle = inner.insert(Capability { address, perms });
+        Ok(handle)
+    }
+
+    pub fn link(&self, handle: usize, mailbox: &Mailbox) -> Result<(), TableError> {
+        assert!(std::ptr::eq(mailbox.store.table, self));
+        let inner = self.inner.borrow();
+        let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+        self.post.link(&entry.cap.address, &mailbox.address);
+        Ok(())
+    }
+
+    pub fn send(&self, handle: usize, data: &[u8], caps: &[usize]) -> Result<(), TableError> {
+        let inner = self.inner.borrow();
+        let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+
+        let mut mapped_caps = Vec::with_capacity(caps.len());
+        for cap in caps.iter() {
+            let entry = inner.entries.get(*cap).ok_or(TableError::InvalidHandle)?;
+            mapped_caps.push(entry.cap);
+        }
+
+        self.post.send(
+            &entry.cap.address,
+            Signal::Message {
+                data,
+                caps: &mapped_caps,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn kill(&self, handle: usize) -> Result<(), TableError> {
+        let inner = self.inner.borrow();
+        let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+        self.post.kill(&entry.cap.address);
+        Ok(())
     }
 }
 
-pub struct TableAddress<'a> {
+pub struct CapabilityHandle<'a> {
     table: &'a Table,
     handle: usize,
 }
 
-impl<'a> Clone for TableAddress<'a> {
+impl<'a> Clone for CapabilityHandle<'a> {
     fn clone(&self) -> Self {
-        self.table.inc_ref(self.handle);
+        self.table.inc_ref(self.handle).unwrap();
 
         Self {
             table: self.table,
@@ -377,57 +460,50 @@ impl<'a> Clone for TableAddress<'a> {
     }
 }
 
-impl<'a> Drop for TableAddress<'a> {
+impl<'a> Drop for CapabilityHandle<'a> {
     fn drop(&mut self) {
-        self.table.dec_ref(self.handle);
+        self.table.dec_ref(self.handle).unwrap();
     }
 }
 
-impl<'a> TableAddress<'a> {
-    pub fn demote(&self, perms: Permissions) -> Self {
-        let mut table = self.table.inner.borrow_mut();
-        let entry = table.entries.get(self.handle).unwrap();
-        let address = entry.cap.address;
-        let handle = table.insert(Capability { address, perms });
+impl<'a> CapabilityHandle<'a> {
+    /// Converts this handle wrapper into a raw handle index.
+    ///
+    /// You should call [Table::dec_ref] when you're done with this raw handle
+    /// to avoid resource leaks.
+    pub fn into_handle(self) -> usize {
+        let handle = self.handle;
+        std::mem::forget(self);
+        handle
+    }
 
-        Self {
+    pub fn get_permissions(&self) -> Permissions {
+        self.table.get_permissions(self.handle).unwrap()
+    }
+
+    pub fn demote(&self, perms: Permissions) -> Result<Self, TableError> {
+        Ok(Self {
             table: self.table,
-            handle,
-        }
+            handle: self.table.demote(self.handle, perms)?,
+        })
     }
 
-    pub(crate) fn signal(&self, signal: Signal) {
-        let table = self.table.inner.borrow();
-        let entry = table.entries.get(self.handle).unwrap();
-        self.table.post.send(&entry.cap.address, signal);
+    pub fn link(&self, mailbox: &Mailbox<'a>) -> Result<(), TableError> {
+        self.table.link(self.handle, mailbox)
     }
 
-    pub fn link(&self, mailbox: &Mailbox<'a>) {
-        assert!(std::ptr::eq(mailbox.store.table, self.table));
-        let inner = self.table.inner.borrow();
-        let entry = inner.entries.get(self.handle).unwrap();
-        self.table.post.link(&entry.cap.address, &mailbox.address);
-    }
-
-    pub fn send(&self, data: &[u8], caps: &[&TableAddress]) {
+    pub fn send(&self, data: &[u8], caps: &[&CapabilityHandle]) -> Result<(), TableError> {
         let mut mapped_caps = Vec::with_capacity(caps.len());
-        let inner = self.table.inner.borrow();
         for cap in caps.iter() {
             assert!(std::ptr::eq(cap.table, self.table));
-            let entry = inner.entries.get(cap.handle).unwrap();
-            mapped_caps.push(entry.cap);
+            mapped_caps.push(cap.handle);
         }
 
-        self.signal(Signal::Message {
-            data,
-            caps: &mapped_caps,
-        });
+        self.table.send(self.handle, data, &mapped_caps)
     }
 
-    pub fn kill(&self) {
-        let inner = self.table.inner.borrow();
-        let entry = inner.entries.get(self.handle).unwrap();
-        self.table.post.kill(&entry.cap.address);
+    pub fn kill(&self) -> Result<(), TableError> {
+        self.table.kill(self.handle)
     }
 }
 
@@ -502,13 +578,13 @@ impl<'a> Mailbox<'a> {
         }
     }
 
-    pub fn make_address(&self, perms: Permissions) -> TableAddress<'a> {
+    pub fn make_capability(&self, perms: Permissions) -> CapabilityHandle<'a> {
         let handle = self.store.table.insert(Capability {
             address: self.address,
             perms,
         });
 
-        TableAddress {
+        CapabilityHandle {
             table: self.store.table,
             handle,
         }
@@ -524,8 +600,8 @@ mod tests {
         let table = Table::new();
         let mb_store = MailboxStore::new(&table);
         let mut mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_address(Permissions::SEND);
-        ad.send(b"Hello world!", &[]);
+        let ad = mb.make_capability(Permissions::SEND);
+        ad.send(b"Hello world!", &[]).unwrap();
 
         assert!(mb
             .recv(|s| {
@@ -543,8 +619,8 @@ mod tests {
         let table = Table::new();
         let mb_store = MailboxStore::new(&table);
         let mut mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_address(Permissions::SEND);
-        ad.send(b"", &[&ad]);
+        let ad = mb.make_capability(Permissions::SEND);
+        ad.send(b"", &[&ad]).unwrap();
 
         assert!(mb
             .recv(move |s| {
@@ -562,8 +638,8 @@ mod tests {
         let table = Table::new();
         let mb_store = MailboxStore::new(&table);
         let mut mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_address(Permissions::KILL);
-        ad.kill();
+        let ad = mb.make_capability(Permissions::KILL);
+        ad.kill().unwrap();
         assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
     }
 
@@ -573,8 +649,8 @@ mod tests {
         let mb_store = MailboxStore::new(&table);
         let mb1 = mb_store.create_mailbox().unwrap();
         let mut mb2 = mb_store.create_mailbox().unwrap();
-        let ad = mb1.make_address(Permissions::KILL);
-        ad.kill();
+        let ad = mb1.make_capability(Permissions::KILL);
+        ad.kill().unwrap();
         assert_eq!(mb2.recv(|s| format!("{:?}", s)).await, None);
     }
 
@@ -590,16 +666,16 @@ mod tests {
 
         let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
 
-        let s_cap = TableAddress {
+        let s_cap = CapabilityHandle {
             table: &table,
             handle: s_handle,
         };
 
-        s_cap.link(&object);
-        s_cap.kill();
+        s_cap.link(&object).unwrap();
+        s_cap.kill().unwrap();
 
         let expected = ContextSignal::Unlink {
-            handle: s_cap.demote(Permissions::empty()).handle,
+            handle: s_cap.demote(Permissions::empty()).unwrap().handle,
         };
 
         object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
@@ -610,13 +686,13 @@ mod tests {
         let table = Table::new();
         let store = MailboxStore::new(&table);
         let s_mb = store.create_mailbox().unwrap();
-        let s_cap = s_mb.make_address(Permissions::LINK);
+        let s_cap = s_mb.make_capability(Permissions::LINK);
         let mut object = store.create_mailbox().unwrap();
-        s_cap.link(&object);
+        s_cap.link(&object).unwrap();
         drop(s_mb);
 
         let expected = ContextSignal::Unlink {
-            handle: s_cap.demote(Permissions::empty()).handle,
+            handle: s_cap.demote(Permissions::empty()).unwrap().handle,
         };
 
         object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
@@ -634,16 +710,16 @@ mod tests {
 
         let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
 
-        let s_cap = TableAddress {
+        let s_cap = CapabilityHandle {
             table: &table,
             handle: s_handle,
         };
 
-        s_cap.kill();
-        s_cap.link(&object);
+        s_cap.kill().unwrap();
+        s_cap.link(&object).unwrap();
 
         let expected = ContextSignal::Unlink {
-            handle: s_cap.demote(Permissions::empty()).handle,
+            handle: s_cap.demote(Permissions::empty()).unwrap().handle,
         };
 
         object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
@@ -654,13 +730,13 @@ mod tests {
         let table = Table::new();
         let store = MailboxStore::new(&table);
         let s_mb = store.create_mailbox().unwrap();
-        let s_cap = s_mb.make_address(Permissions::LINK);
+        let s_cap = s_mb.make_capability(Permissions::LINK);
         let mut object = store.create_mailbox().unwrap();
         drop(s_mb);
-        s_cap.link(&object);
+        s_cap.link(&object).unwrap();
 
         let expected = ContextSignal::Unlink {
-            handle: s_cap.demote(Permissions::empty()).handle,
+            handle: s_cap.demote(Permissions::empty()).unwrap().handle,
         };
 
         object.recv(move |s| assert_eq!(s, expected)).await.unwrap();

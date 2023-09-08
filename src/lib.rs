@@ -19,7 +19,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    fmt::Debug,
+    fmt::{Debug, Display},
     ops::Deref,
     sync::Arc,
 };
@@ -258,6 +258,15 @@ pub enum TableError {
 
     /// A handle used in this table operation does not have sufficient permissions.
     PermissionDenied,
+}
+
+impl Display for TableError {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            TableError::InvalidHandle => write!(fmt, "invalid handle"),
+            TableError::PermissionDenied => write!(fmt, "permission denied"),
+        }
+    }
 }
 
 #[derive(Debug)]

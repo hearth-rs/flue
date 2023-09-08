@@ -256,31 +256,13 @@ struct TableEntry {
     refs: usize,
 }
 
-pub struct Table {
-    post: Arc<PostOffice>,
+struct TableInner {
     entries: Slab<TableEntry>,
     reverse_entries: HashMap<Capability, usize>,
 }
 
-impl Table {
-    pub fn new() -> RefCell<Self> {
-        let post = PostOffice::new();
-        Self::new_in(post)
-    }
-
-    pub fn spawn(&self) -> RefCell<Self> {
-        Self::new_in(self.post.clone())
-    }
-
-    pub(crate) fn new_in(post: Arc<PostOffice>) -> RefCell<Self> {
-        RefCell::new(Self {
-            post,
-            entries: Slab::new(),
-            reverse_entries: HashMap::new(),
-        })
-    }
-
-    pub(crate) fn insert(&mut self, cap: Capability) -> usize {
+impl TableInner {
+    pub fn insert(&mut self, cap: Capability) -> usize {
         use std::collections::hash_map::Entry;
         let entry = self.reverse_entries.entry(cap);
         match entry {
@@ -298,8 +280,41 @@ impl Table {
             }
         }
     }
+}
 
-    pub(crate) fn map_signal<'a>(&mut self, signal: Signal<'a>) -> ContextSignal<'a> {
+pub struct Table {
+    post: Arc<PostOffice>,
+    inner: RefCell<TableInner>,
+}
+
+impl Table {
+    /// Creates a new [Table] in **a new [PostOffice]**.
+    pub fn new() -> Self {
+        let post = PostOffice::new();
+        Self::new_in(post)
+    }
+
+    /// Creates a new [Table] in the same [PostOffice].
+    pub fn spawn(&self) -> Self {
+        Self::new_in(self.post.clone())
+    }
+
+    /// Creates a new [Table] in a specific [PostOffice].
+    pub fn new_in(post: Arc<PostOffice>) -> Self {
+        Self {
+            post,
+            inner: RefCell::new(TableInner {
+                entries: Slab::new(),
+                reverse_entries: HashMap::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn insert(&self, cap: Capability) -> usize {
+        self.inner.borrow_mut().insert(cap)
+    }
+
+    pub(crate) fn map_signal<'a>(&self, signal: Signal<'a>) -> ContextSignal<'a> {
         match signal {
             Signal::Unlink { address } => ContextSignal::Unlink {
                 handle: self.insert(Capability {
@@ -314,9 +329,11 @@ impl Table {
         }
     }
 
-    pub fn import<'a>(&mut self, mailbox: &Mailbox<'a>, perms: Permissions) -> usize {
-        let other = mailbox.store.table.borrow();
-        assert_eq!(Arc::as_ptr(&self.post), Arc::as_ptr(&other.post));
+    pub fn import<'a>(&self, mailbox: &Mailbox<'a>, perms: Permissions) -> usize {
+        assert_eq!(
+            Arc::as_ptr(&self.post),
+            Arc::as_ptr(&mailbox.store.table.post)
+        );
 
         self.insert(Capability {
             address: mailbox.address,
@@ -324,28 +341,34 @@ impl Table {
         })
     }
 
-    pub fn inc_ref(&mut self, handle: usize) {
-        self.entries.get_mut(handle).unwrap().refs += 1;
+    pub fn inc_ref(&self, handle: usize) {
+        self.inner
+            .borrow_mut()
+            .entries
+            .get_mut(handle)
+            .unwrap()
+            .refs += 1;
     }
 
-    pub fn dec_ref(&mut self, handle: usize) {
-        let entry = self.entries.get_mut(handle).unwrap();
+    pub fn dec_ref(&self, handle: usize) {
+        let mut inner = self.inner.borrow_mut();
+        let entry = inner.entries.get_mut(handle).unwrap();
         if entry.refs <= 1 {
             entry.refs -= 1;
         } else {
-            self.entries.remove(handle);
+            inner.entries.remove(handle);
         }
     }
 }
 
 pub struct TableAddress<'a> {
-    table: &'a RefCell<Table>,
+    table: &'a Table,
     handle: usize,
 }
 
 impl<'a> Clone for TableAddress<'a> {
     fn clone(&self) -> Self {
-        self.table.borrow_mut().inc_ref(self.handle);
+        self.table.inc_ref(self.handle);
 
         Self {
             table: self.table,
@@ -356,13 +379,13 @@ impl<'a> Clone for TableAddress<'a> {
 
 impl<'a> Drop for TableAddress<'a> {
     fn drop(&mut self) {
-        self.table.borrow_mut().dec_ref(self.handle);
+        self.table.dec_ref(self.handle);
     }
 }
 
 impl<'a> TableAddress<'a> {
     pub fn demote(&self, perms: Permissions) -> Self {
-        let mut table = self.table.borrow_mut();
+        let mut table = self.table.inner.borrow_mut();
         let entry = table.entries.get(self.handle).unwrap();
         let address = entry.cap.address;
         let handle = table.insert(Capability { address, perms });
@@ -374,25 +397,24 @@ impl<'a> TableAddress<'a> {
     }
 
     pub(crate) fn signal(&self, signal: Signal) {
-        let table = self.table.borrow();
+        let table = self.table.inner.borrow();
         let entry = table.entries.get(self.handle).unwrap();
-        table.post.send(&entry.cap.address, signal);
+        self.table.post.send(&entry.cap.address, signal);
     }
 
     pub fn link(&self, mailbox: &Mailbox<'a>) {
-        assert_eq!(mailbox.store.table.as_ptr(), self.table.as_ptr());
-
-        let table = self.table.borrow();
-        let entry = table.entries.get(self.handle).unwrap();
-        table.post.link(&entry.cap.address, &mailbox.address);
+        assert!(std::ptr::eq(mailbox.store.table, self.table));
+        let inner = self.table.inner.borrow();
+        let entry = inner.entries.get(self.handle).unwrap();
+        self.table.post.link(&entry.cap.address, &mailbox.address);
     }
 
     pub fn send(&self, data: &[u8], caps: &[&TableAddress]) {
         let mut mapped_caps = Vec::with_capacity(caps.len());
-        let table = self.table.borrow();
+        let inner = self.table.inner.borrow();
         for cap in caps.iter() {
-            assert_eq!(cap.table.as_ptr(), self.table.as_ptr());
-            let entry = table.entries.get(cap.handle).unwrap();
+            assert!(std::ptr::eq(cap.table, self.table));
+            let entry = inner.entries.get(cap.handle).unwrap();
             mapped_caps.push(entry.cap);
         }
 
@@ -403,19 +425,19 @@ impl<'a> TableAddress<'a> {
     }
 
     pub fn kill(&self) {
-        let table = self.table.borrow();
-        let entry = table.entries.get(self.handle).unwrap();
-        table.post.kill(&entry.cap.address);
+        let inner = self.table.inner.borrow();
+        let entry = inner.entries.get(self.handle).unwrap();
+        self.table.post.kill(&entry.cap.address);
     }
 }
 
 pub struct MailboxStore<'a> {
-    table: &'a RefCell<Table>,
+    table: &'a Table,
     group: Arc<Mutex<RouteGroup>>,
 }
 
 impl<'a> MailboxStore<'a> {
-    pub fn new(table: &'a RefCell<Table>) -> Self {
+    pub fn new(table: &'a Table) -> Self {
         Self {
             table,
             group: Arc::new(Mutex::new(RouteGroup {
@@ -433,7 +455,7 @@ impl<'a> MailboxStore<'a> {
         }
 
         let (tx, rx) = channel();
-        let address = self.table.borrow().post.insert(tx, self.group.clone());
+        let address = self.table.post.insert(tx, self.group.clone());
         group.addresses.insert(address);
 
         Some(Mailbox {
@@ -452,8 +474,7 @@ pub struct Mailbox<'a> {
 
 impl<'a> Drop for Mailbox<'a> {
     fn drop(&mut self) {
-        let table = self.store.table.borrow();
-        table.post.close(&self.address);
+        self.store.table.post.close(&self.address);
     }
 }
 
@@ -461,8 +482,7 @@ impl<'a> Mailbox<'a> {
     pub async fn recv<T>(&mut self, mut f: impl FnMut(ContextSignal) -> T) -> Option<T> {
         self.rx
             .recv(|signal| {
-                let mut table = self.store.table.borrow_mut();
-                let signal = table.map_signal(signal);
+                let signal = self.store.table.map_signal(signal);
                 f(signal)
             })
             .await
@@ -471,8 +491,7 @@ impl<'a> Mailbox<'a> {
 
     pub fn try_recv<T>(&mut self, mut f: impl FnMut(ContextSignal) -> T) -> Option<Option<T>> {
         let result = self.rx.try_recv(|signal| {
-            let mut table = self.store.table.borrow_mut();
-            let signal = table.map_signal(signal);
+            let signal = self.store.table.map_signal(signal);
             f(signal)
         });
 
@@ -484,7 +503,7 @@ impl<'a> Mailbox<'a> {
     }
 
     pub fn make_address(&self, perms: Permissions) -> TableAddress<'a> {
-        let handle = self.store.table.borrow_mut().insert(Capability {
+        let handle = self.store.table.insert(Capability {
             address: self.address,
             perms,
         });
@@ -565,13 +584,11 @@ mod tests {
         let o_store = MailboxStore::new(&table);
         let mut object = o_store.create_mailbox().unwrap();
 
-        let child = table.borrow().spawn();
+        let child = table.spawn();
         let s_store = MailboxStore::new(&child);
         let s_mb = s_store.create_mailbox().unwrap();
 
-        let s_handle = table
-            .borrow_mut()
-            .import(&s_mb, Permissions::LINK | Permissions::KILL);
+        let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
 
         let s_cap = TableAddress {
             table: &table,
@@ -611,13 +628,11 @@ mod tests {
         let o_store = MailboxStore::new(&table);
         let mut object = o_store.create_mailbox().unwrap();
 
-        let child = table.borrow().spawn();
+        let child = table.spawn();
         let s_store = MailboxStore::new(&child);
         let s_mb = s_store.create_mailbox().unwrap();
 
-        let s_handle = table
-            .borrow_mut()
-            .import(&s_mb, Permissions::LINK | Permissions::KILL);
+        let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
 
         let s_cap = TableAddress {
             table: &table,

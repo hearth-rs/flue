@@ -598,7 +598,7 @@ impl<'a> Drop for Mailbox<'a> {
 }
 
 impl<'a> Mailbox<'a> {
-    pub async fn recv<T>(&mut self, mut f: impl FnMut(ContextSignal) -> T) -> Option<T> {
+    pub async fn recv<T>(&self, mut f: impl FnMut(ContextSignal) -> T) -> Option<T> {
         self.rx
             .recv(|signal| {
                 let signal = self.store.table.map_signal(signal);
@@ -608,7 +608,7 @@ impl<'a> Mailbox<'a> {
             .ok()
     }
 
-    pub fn try_recv<T>(&mut self, mut f: impl FnMut(ContextSignal) -> T) -> Option<Option<T>> {
+    pub fn try_recv<T>(&self, mut f: impl FnMut(ContextSignal) -> T) -> Option<Option<T>> {
         let result = self.rx.try_recv(|signal| {
             let signal = self.store.table.map_signal(signal);
             f(signal)
@@ -642,7 +642,7 @@ mod tests {
     async fn send_message() {
         let table = Table::default();
         let mb_store = MailboxStore::new(&table);
-        let mut mb = mb_store.create_mailbox().unwrap();
+        let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::SEND);
         ad.send(b"Hello world!", &[]).unwrap();
 
@@ -661,7 +661,7 @@ mod tests {
     async fn send_address() {
         let table = Table::default();
         let mb_store = MailboxStore::new(&table);
-        let mut mb = mb_store.create_mailbox().unwrap();
+        let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::SEND);
         ad.send(b"", &[&ad]).unwrap();
 
@@ -680,7 +680,7 @@ mod tests {
     async fn try_recv() {
         let table = Table::default();
         let mb_store = MailboxStore::new(&table);
-        let mut mb = mb_store.create_mailbox().unwrap();
+        let mb = mb_store.create_mailbox().unwrap();
 
         assert_eq!(mb.try_recv(|_| ()), Some(None));
 
@@ -742,7 +742,7 @@ mod tests {
     async fn kill() {
         let table = Table::default();
         let mb_store = MailboxStore::new(&table);
-        let mut mb = mb_store.create_mailbox().unwrap();
+        let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::KILL);
         ad.kill().unwrap();
         assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
@@ -752,7 +752,7 @@ mod tests {
     async fn double_kill() {
         let table = Table::default();
         let mb_store = MailboxStore::new(&table);
-        let mut mb = mb_store.create_mailbox().unwrap();
+        let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::KILL);
         ad.kill().unwrap();
         ad.kill().unwrap();
@@ -776,7 +776,7 @@ mod tests {
         let table = Table::default();
         let mb_store = MailboxStore::new(&table);
         let mb1 = mb_store.create_mailbox().unwrap();
-        let mut mb2 = mb_store.create_mailbox().unwrap();
+        let mb2 = mb_store.create_mailbox().unwrap();
         let ad = mb1.make_capability(Permissions::KILL);
         ad.kill().unwrap();
         assert_eq!(mb2.recv(|s| format!("{:?}", s)).await, None);
@@ -786,7 +786,7 @@ mod tests {
     async fn unlink_on_kill() {
         let table = Table::default();
         let o_store = MailboxStore::new(&table);
-        let mut object = o_store.create_mailbox().unwrap();
+        let object = o_store.create_mailbox().unwrap();
 
         let child = table.spawn();
         let s_store = MailboxStore::new(&child);
@@ -815,7 +815,7 @@ mod tests {
         let store = MailboxStore::new(&table);
         let s_mb = store.create_mailbox().unwrap();
         let s_cap = s_mb.make_capability(Permissions::LINK);
-        let mut object = store.create_mailbox().unwrap();
+        let object = store.create_mailbox().unwrap();
         s_cap.link(&object).unwrap();
         drop(s_mb);
 
@@ -830,7 +830,7 @@ mod tests {
     async fn unlink_dead() {
         let table = Table::default();
         let o_store = MailboxStore::new(&table);
-        let mut object = o_store.create_mailbox().unwrap();
+        let object = o_store.create_mailbox().unwrap();
 
         let child = table.spawn();
         let s_store = MailboxStore::new(&child);
@@ -859,7 +859,7 @@ mod tests {
         let store = MailboxStore::new(&table);
         let s_mb = store.create_mailbox().unwrap();
         let s_cap = s_mb.make_capability(Permissions::LINK);
-        let mut object = store.create_mailbox().unwrap();
+        let object = store.create_mailbox().unwrap();
         drop(s_mb);
         s_cap.link(&object).unwrap();
 

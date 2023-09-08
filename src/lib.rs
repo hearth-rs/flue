@@ -465,22 +465,27 @@ impl Table {
     }
 
     pub async fn send(&self, handle: usize, data: &[u8], caps: &[usize]) -> Result<(), TableError> {
-        let inner = self.inner.lock();
-        let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+        // move into block to make this future Send
+        let (address, mapped_caps) = {
+            let inner = self.inner.lock();
+            let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
 
-        if !entry.cap.perms.contains(Permissions::SEND) {
-            return Err(TableError::PermissionDenied);
-        }
+            if !entry.cap.perms.contains(Permissions::SEND) {
+                return Err(TableError::PermissionDenied);
+            }
 
-        let mut mapped_caps = Vec::with_capacity(caps.len());
-        for cap in caps.iter() {
-            let entry = inner.entries.get(*cap).ok_or(TableError::InvalidHandle)?;
-            mapped_caps.push(entry.cap);
-        }
+            let mut mapped_caps = Vec::with_capacity(caps.len());
+            for cap in caps.iter() {
+                let entry = inner.entries.get(*cap).ok_or(TableError::InvalidHandle)?;
+                mapped_caps.push(entry.cap);
+            }
+
+            (entry.cap.address, mapped_caps)
+        };
 
         self.post
             .send(
-                &entry.cap.address,
+                &address,
                 Signal::Message {
                     data,
                     caps: &mapped_caps,
@@ -703,6 +708,30 @@ mod tests {
             })
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn table_send_impls_send() {
+        let table = Table::default();
+
+        tokio::spawn(async move {
+            let mb_store = MailboxStore::new(&table);
+            let mb = mb_store.create_mailbox().unwrap();
+            let ad = mb.make_capability(Permissions::SEND);
+            ad.send(b"Hello world!", &[]).await.unwrap();
+
+            assert!(mb
+                .recv(|s| {
+                    s == ContextSignal::Message {
+                        data: b"Hello world!",
+                        caps: vec![],
+                    }
+                })
+                .await
+                .unwrap());
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

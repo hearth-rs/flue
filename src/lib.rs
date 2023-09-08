@@ -76,8 +76,28 @@ pub enum ContextSignal<'a> {
     Message { data: &'a [u8], caps: Vec<usize> },
 }
 
+struct RouteGroup {
+    addresses: HashSet<Address>,
+    dead: bool,
+}
+
+impl RouteGroup {
+    pub fn kill(&mut self, post: &PostOffice) {
+        if self.dead {
+            return;
+        }
+
+        self.dead = true;
+
+        for address in self.addresses.iter() {
+            post.close(address);
+        }
+    }
+}
+
 struct Route {
     tx: Option<Sender<OwnedSignal>>,
+    group: Option<Arc<Mutex<RouteGroup>>>,
     links: Mutex<HashSet<Address>>,
     generation: u32,
 }
@@ -86,6 +106,7 @@ impl Default for Route {
     fn default() -> Self {
         Self {
             tx: None,
+            group: None,
             links: Mutex::new(HashSet::new()),
             generation: 0,
         }
@@ -95,6 +116,7 @@ impl Default for Route {
 impl Clear for Route {
     fn clear(&mut self) {
         self.tx.take();
+        self.group.take();
         self.links.lock().clear();
         self.generation += 1;
     }
@@ -111,9 +133,10 @@ impl PostOffice {
         })
     }
 
-    pub(crate) fn insert(&self, tx: Sender<OwnedSignal>) -> Address {
+    pub(crate) fn insert(&self, tx: Sender<OwnedSignal>, group: Arc<Mutex<RouteGroup>>) -> Address {
         let mut route = self.routes.create().unwrap();
         route.tx = Some(tx);
+        route.group = Some(group);
 
         Address {
             handle: route.key(),
@@ -122,6 +145,14 @@ impl PostOffice {
     }
 
     pub(crate) fn kill(&self, address: &Address) {
+        let Some(route) = self.get_route(address) else {
+            return;
+        };
+
+        route.group.as_ref().unwrap().lock().kill(self);
+    }
+
+    pub(crate) fn close(&self, address: &Address) {
         let Some(route) = self.get_route(address) else {
             return;
         };
@@ -138,7 +169,7 @@ impl PostOffice {
         // shorthand to immediately unlink
         let unlink = move || {
             self.send(&object, Signal::Unlink { address: *subject });
-            self.kill(&subject);
+            self.close(&subject);
         };
 
         let Some(route) = self.get_route(subject) else {
@@ -172,9 +203,9 @@ impl PostOffice {
         // send signal
         let result = tx.send(signal);
 
-        // kill this route if the receiver was dropped
+        // close this route if the receiver was dropped
         if result.is_err() {
-            self.kill(address);
+            self.close(address);
         }
     }
 
@@ -266,7 +297,7 @@ impl Table {
     }
 
     pub fn import<'a>(&mut self, mailbox: &Mailbox<'a>, perms: Permissions) -> usize {
-        let other = mailbox.table.borrow();
+        let other = mailbox.store.table.borrow();
         assert_eq!(Arc::as_ptr(&self.post), Arc::as_ptr(&other.post));
 
         self.insert(Capability {
@@ -331,7 +362,7 @@ impl<'a> TableAddress<'a> {
     }
 
     pub fn link(&self, mailbox: &Mailbox<'a>) {
-        assert_eq!(mailbox.table.as_ptr(), self.table.as_ptr());
+        assert_eq!(mailbox.store.table.as_ptr(), self.table.as_ptr());
 
         let table = self.table.borrow();
         let entry = table.entries.get(self.handle).unwrap();
@@ -360,30 +391,59 @@ impl<'a> TableAddress<'a> {
     }
 }
 
-pub struct Mailbox<'a> {
+pub struct MailboxStore<'a> {
     table: &'a RefCell<Table>,
+    group: Arc<Mutex<RouteGroup>>,
+}
+
+impl<'a> MailboxStore<'a> {
+    pub fn new(table: &'a RefCell<Table>) -> Self {
+        Self {
+            table,
+            group: Arc::new(Mutex::new(RouteGroup {
+                addresses: HashSet::new(),
+                dead: false,
+            })),
+        }
+    }
+
+    pub fn create_mailbox(&self) -> Option<Mailbox<'_>> {
+        let mut group = self.group.lock();
+
+        if group.dead {
+            return None;
+        }
+
+        let (tx, rx) = channel();
+        let address = self.table.borrow().post.insert(tx, self.group.clone());
+        group.addresses.insert(address);
+
+        Some(Mailbox {
+            store: self,
+            address,
+            rx,
+        })
+    }
+}
+
+pub struct Mailbox<'a> {
+    store: &'a MailboxStore<'a>,
     address: Address,
     rx: Receiver<OwnedSignal>,
 }
 
 impl<'a> Drop for Mailbox<'a> {
     fn drop(&mut self) {
-        let table = self.table.borrow();
-        table.post.kill(&self.address);
+        let table = self.store.table.borrow();
+        table.post.close(&self.address);
     }
 }
 
 impl<'a> Mailbox<'a> {
-    pub fn new(table: &'a RefCell<Table>) -> Self {
-        let (tx, rx) = channel();
-        let address = table.borrow().post.insert(tx);
-        Self { table, address, rx }
-    }
-
     pub async fn recv<T>(&mut self, mut f: impl FnMut(ContextSignal) -> T) -> Option<T> {
         self.rx
             .recv(|signal| {
-                let mut table = self.table.borrow_mut();
+                let mut table = self.store.table.borrow_mut();
                 let signal = table.map_signal(signal);
                 f(signal)
             })
@@ -393,7 +453,7 @@ impl<'a> Mailbox<'a> {
 
     pub fn try_recv<T>(&mut self, mut f: impl FnMut(ContextSignal) -> T) -> Option<Option<T>> {
         let result = self.rx.try_recv(|signal| {
-            let mut table = self.table.borrow_mut();
+            let mut table = self.store.table.borrow_mut();
             let signal = table.map_signal(signal);
             f(signal)
         });
@@ -406,13 +466,13 @@ impl<'a> Mailbox<'a> {
     }
 
     pub fn make_address(&self, perms: Permissions) -> TableAddress<'a> {
-        let handle = self.table.borrow_mut().insert(Capability {
+        let handle = self.store.table.borrow_mut().insert(Capability {
             address: self.address,
             perms,
         });
 
         TableAddress {
-            table: self.table,
+            table: self.store.table,
             handle,
         }
     }
@@ -425,7 +485,8 @@ mod tests {
     #[tokio::test]
     async fn send_message() {
         let table = Table::new();
-        let mut mb = Mailbox::new(&table);
+        let mb_store = MailboxStore::new(&table);
+        let mut mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_address(Permissions::SEND);
         ad.send(b"Hello world!", &[]);
 
@@ -443,7 +504,8 @@ mod tests {
     #[tokio::test]
     async fn send_address() {
         let table = Table::new();
-        let mut mb = Mailbox::new(&table);
+        let mb_store = MailboxStore::new(&table);
+        let mut mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_address(Permissions::SEND);
         ad.send(b"", &[&ad]);
 
@@ -461,7 +523,8 @@ mod tests {
     #[tokio::test]
     async fn kill() {
         let table = Table::new();
-        let mut mb = Mailbox::new(&table);
+        let mb_store = MailboxStore::new(&table);
+        let mut mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_address(Permissions::KILL);
         ad.kill();
         assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
@@ -470,8 +533,9 @@ mod tests {
     #[tokio::test]
     async fn kill_all_mailboxes() {
         let table = Table::new();
-        let mb1 = Mailbox::new(&table);
-        let mut mb2 = Mailbox::new(&table);
+        let mb_store = MailboxStore::new(&table);
+        let mb1 = mb_store.create_mailbox().unwrap();
+        let mut mb2 = mb_store.create_mailbox().unwrap();
         let ad = mb1.make_address(Permissions::KILL);
         ad.kill();
         assert_eq!(mb2.recv(|s| format!("{:?}", s)).await, None);
@@ -480,10 +544,12 @@ mod tests {
     #[tokio::test]
     async fn unlink_on_kill() {
         let table = Table::new();
-        let mut object = Mailbox::new(&table);
+        let o_store = MailboxStore::new(&table);
+        let mut object = o_store.create_mailbox().unwrap();
 
         let child = table.borrow().spawn();
-        let s_mb = Mailbox::new(&child);
+        let s_store = MailboxStore::new(&child);
+        let s_mb = s_store.create_mailbox().unwrap();
 
         let s_handle = table
             .borrow_mut()
@@ -507,9 +573,10 @@ mod tests {
     #[tokio::test]
     async fn unlink_on_close() {
         let table = Table::new();
-        let s_mb = Mailbox::new(&table);
+        let store = MailboxStore::new(&table);
+        let s_mb = store.create_mailbox().unwrap();
         let s_cap = s_mb.make_address(Permissions::LINK);
-        let mut object = Mailbox::new(&table);
+        let mut object = store.create_mailbox().unwrap();
         s_cap.link(&object);
         drop(s_mb);
 
@@ -523,10 +590,12 @@ mod tests {
     #[tokio::test]
     async fn unlink_dead() {
         let table = Table::new();
-        let mut object = Mailbox::new(&table);
+        let o_store = MailboxStore::new(&table);
+        let mut object = o_store.create_mailbox().unwrap();
 
         let child = table.borrow().spawn();
-        let s_mb = Mailbox::new(&child);
+        let s_store = MailboxStore::new(&child);
+        let s_mb = s_store.create_mailbox().unwrap();
 
         let s_handle = table
             .borrow_mut()
@@ -550,9 +619,10 @@ mod tests {
     #[tokio::test]
     async fn unlink_closed() {
         let table = Table::new();
-        let s_mb = Mailbox::new(&table);
+        let store = MailboxStore::new(&table);
+        let s_mb = store.create_mailbox().unwrap();
         let s_cap = s_mb.make_address(Permissions::LINK);
-        let mut object = Mailbox::new(&table);
+        let mut object = store.create_mailbox().unwrap();
         drop(s_mb);
         s_cap.link(&object);
 

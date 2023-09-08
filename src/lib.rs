@@ -339,9 +339,14 @@ impl Table {
         }
     }
 
+    /// Tests if a raw capability handle is valid within this table.
+    pub fn is_valid(&self, handle: usize) -> bool {
+        self.inner.borrow().entries.contains(handle)
+    }
+
     /// Wraps a raw capability handle in a Rust-friendly [CapabilityHandle] struct.
     pub fn wrap_handle(&self, handle: usize) -> Result<CapabilityHandle, TableError> {
-        if !self.inner.borrow().entries.contains(handle) {
+        if !self.is_valid(handle) {
             return Err(TableError::InvalidHandle);
         }
 
@@ -663,6 +668,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_recv() {
+        let table = Table::new();
+        let mb_store = MailboxStore::new(&table);
+        let mut mb = mb_store.create_mailbox().unwrap();
+
+        assert_eq!(mb.try_recv(|_| ()), Some(None));
+
+        let ad = mb.make_capability(Permissions::SEND);
+        ad.send(b"Hello world!", &[]).unwrap();
+
+        assert!(mb
+            .try_recv(|s| {
+                s == ContextSignal::Message {
+                    data: b"Hello world!",
+                    caps: vec![],
+                }
+            })
+            .unwrap()
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn deny_send() {
         let table = Table::new();
         let mb_store = MailboxStore::new(&table);
@@ -710,6 +737,29 @@ mod tests {
         let ad = mb.make_capability(Permissions::KILL);
         ad.kill().unwrap();
         assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
+    }
+
+    #[tokio::test]
+    async fn double_kill() {
+        let table = Table::new();
+        let mb_store = MailboxStore::new(&table);
+        let mut mb = mb_store.create_mailbox().unwrap();
+        let ad = mb.make_capability(Permissions::KILL);
+        ad.kill().unwrap();
+        ad.kill().unwrap();
+        assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
+    }
+
+    #[tokio::test]
+    async fn dropped_handles_are_freed() {
+        let table = Table::new();
+        let mb_store = MailboxStore::new(&table);
+        let mb = mb_store.create_mailbox().unwrap();
+        let ad = mb.make_capability(Permissions::empty());
+        let handle = ad.handle;
+        assert!(table.is_valid(handle));
+        drop(ad);
+        assert!(!table.is_valid(handle));
     }
 
     #[tokio::test]

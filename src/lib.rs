@@ -382,10 +382,11 @@ impl Table {
             .get_mut(handle)
             .ok_or(TableError::InvalidHandle)?;
 
-        if entry.refs <= 1 {
+        if entry.refs > 1 {
             entry.refs -= 1;
         } else {
-            inner.entries.remove(handle);
+            let entry = inner.entries.remove(handle);
+            inner.reverse_entries.remove(&entry.cap);
         }
 
         Ok(())

@@ -17,7 +17,6 @@
 // along with Flue. If not, see <https://www.gnu.org/licenses/>.
 
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
     fmt::{Debug, Display},
     ops::Deref,
@@ -303,7 +302,7 @@ impl TableInner {
 
 pub struct Table {
     post: Arc<PostOffice>,
-    inner: RefCell<TableInner>,
+    inner: Mutex<TableInner>,
 }
 
 impl Default for Table {
@@ -318,7 +317,7 @@ impl Table {
     pub fn new(post: Arc<PostOffice>) -> Self {
         Self {
             post,
-            inner: RefCell::new(TableInner {
+            inner: Mutex::new(TableInner {
                 entries: Slab::new(),
                 reverse_entries: HashMap::new(),
             }),
@@ -331,7 +330,7 @@ impl Table {
     }
 
     pub(crate) fn insert(&self, cap: Capability) -> usize {
-        self.inner.borrow_mut().insert(cap)
+        self.inner.lock().insert(cap)
     }
 
     pub(crate) fn map_signal<'a>(&self, signal: Signal<'a>) -> ContextSignal<'a> {
@@ -351,7 +350,7 @@ impl Table {
 
     /// Tests if a raw capability handle is valid within this table.
     pub fn is_valid(&self, handle: usize) -> bool {
-        self.inner.borrow().entries.contains(handle)
+        self.inner.lock().entries.contains(handle)
     }
 
     /// Wraps a raw capability handle in a Rust-friendly [CapabilityHandle] struct.
@@ -380,7 +379,7 @@ impl Table {
 
     pub fn inc_ref(&self, handle: usize) -> Result<(), TableError> {
         self.inner
-            .borrow_mut()
+            .lock()
             .entries
             .get_mut(handle)
             .ok_or(TableError::InvalidHandle)?
@@ -390,7 +389,7 @@ impl Table {
     }
 
     pub fn dec_ref(&self, handle: usize) -> Result<(), TableError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock();
 
         let entry = inner
             .entries
@@ -409,7 +408,7 @@ impl Table {
 
     pub fn get_permissions(&self, handle: usize) -> Result<Permissions, TableError> {
         self.inner
-            .borrow()
+            .lock()
             .entries
             .get(handle)
             .ok_or(TableError::InvalidHandle)
@@ -417,7 +416,7 @@ impl Table {
     }
 
     pub fn demote(&self, handle: usize, perms: Permissions) -> Result<usize, TableError> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
         let address = entry.cap.address;
 
@@ -431,7 +430,7 @@ impl Table {
 
     pub fn link(&self, handle: usize, mailbox: &Mailbox) -> Result<(), TableError> {
         assert!(std::ptr::eq(mailbox.store.table, self));
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
 
         if !entry.cap.perms.contains(Permissions::LINK) {
@@ -443,7 +442,7 @@ impl Table {
     }
 
     pub fn send(&self, handle: usize, data: &[u8], caps: &[usize]) -> Result<(), TableError> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
 
         if !entry.cap.perms.contains(Permissions::SEND) {
@@ -468,7 +467,7 @@ impl Table {
     }
 
     pub fn kill(&self, handle: usize) -> Result<(), TableError> {
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
 
         if !entry.cap.perms.contains(Permissions::KILL) {

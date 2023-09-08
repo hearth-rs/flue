@@ -268,6 +268,8 @@ impl Display for TableError {
     }
 }
 
+impl std::error::Error for TableError {}
+
 #[derive(Debug)]
 struct TableEntry {
     cap: Capability,

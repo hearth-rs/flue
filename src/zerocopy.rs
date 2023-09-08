@@ -16,6 +16,13 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with Flue. If not, see <https://www.gnu.org/licenses/>.
 
+use std::{
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use flume::{RecvError, SendError, TryRecvError};
 
 pub trait OwningMessage: 'static {
@@ -36,13 +43,27 @@ impl<T> Sender<T>
 where
     T: OwningMessage,
 {
-    pub fn send(&self, data: T::NonOwning<'_>) -> Result<(), SendError<T>> {
+    pub fn send<'a>(&self, data: T::NonOwning<'a>) -> Result<SendFut<'a>, SendError<T>> {
         let owned = data.to_owned();
-        self.inner_tx.send(owned)
+        self.inner_tx.send(owned)?;
+        let fut = SendFut { _lock: PhantomData };
+        Ok(fut)
     }
 
     pub fn receiver_count(&self) -> usize {
         self.inner_tx.receiver_count()
+    }
+}
+
+pub struct SendFut<'a> {
+    _lock: PhantomData<&'a ()>,
+}
+
+impl<'a> Future for SendFut<'a> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Ready(())
     }
 }
 
@@ -110,7 +131,7 @@ mod tests {
         let sent = "shared string";
         let test = |received: &str| sent.as_ptr() == received.as_ptr();
         let join_rx = tokio::spawn(async move { rx.recv(test).await });
-        tx.send(sent).unwrap();
+        tx.send(sent).unwrap().await;
         assert!(join_rx.await.unwrap().unwrap());
     }
 }

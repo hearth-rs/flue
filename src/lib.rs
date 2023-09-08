@@ -100,7 +100,7 @@ struct RouteGroup {
 }
 
 impl RouteGroup {
-    pub fn kill(&mut self, post: &PostOffice) {
+    pub fn kill(&mut self, post: &Arc<PostOffice>) {
         if self.dead {
             return;
         }
@@ -162,7 +162,7 @@ impl PostOffice {
         }
     }
 
-    pub(crate) fn kill(&self, address: &Address) {
+    pub(crate) fn kill(self: &Arc<Self>, address: &Address) {
         let Some(route) = self.get_route(address) else {
             return;
         };
@@ -170,24 +170,64 @@ impl PostOffice {
         route.group.as_ref().unwrap().lock().kill(self);
     }
 
-    pub(crate) fn close(&self, address: &Address) {
+    pub(crate) fn close(self: &Arc<Self>, address: &Address) {
         let Some(route) = self.get_route(address) else {
             return;
         };
 
-        let links = route.links.lock();
-        for link in links.iter() {
-            self.send(link, Signal::Unlink { address: *address });
-        }
+        let address = *address;
+        let links = route.links.lock().to_owned();
+        let post = self.to_owned();
+
+        tokio::spawn(async move {
+            for link in links {
+                post.send(&link, Signal::Unlink { address }).await;
+            }
+        });
 
         self.routes.clear(address.handle);
     }
 
-    pub(crate) fn link(&self, subject: &Address, object: &Address) {
+    pub(crate) async fn send(self: &Arc<Self>, address: &Address, signal: Signal<'_>) {
+        let result = {
+            let Some(route) = self.get_route(address) else {
+                return;
+            };
+
+            // fetch sender, if available
+            let Some(tx) = &route.tx else {
+                return;
+            };
+
+            // send signal
+            let result = tx.send(signal);
+
+            result
+        };
+
+        // close this route if the receiver was dropped
+        let fut = if let Ok(fut) = result {
+            fut
+        } else {
+            self.close(address);
+            return;
+        };
+
+        // wait for send to complete
+        fut.await;
+    }
+
+    pub(crate) fn link(self: &Arc<Self>, subject: &Address, object: &Address) {
         // shorthand to immediately unlink
-        let unlink = move || {
-            self.send(object, Signal::Unlink { address: *subject });
-            self.close(subject);
+        let unlink = || {
+            let subject = *subject;
+            let object = *object;
+            let post = self.to_owned();
+            tokio::spawn(async move {
+                post.send(&object, Signal::Unlink { address: subject })
+                    .await;
+                post.close(&subject);
+            })
         };
 
         let Some(route) = self.get_route(subject) else {
@@ -206,25 +246,6 @@ impl PostOffice {
         }
 
         route.links.lock().insert(*object);
-    }
-
-    pub(crate) fn send(&self, address: &Address, signal: Signal) {
-        let Some(route) = self.get_route(address) else {
-            return;
-        };
-
-        // fetch sender, if available
-        let Some(tx) = &route.tx else {
-            return;
-        };
-
-        // send signal
-        let result = tx.send(signal);
-
-        // close this route if the receiver was dropped
-        if result.is_err() {
-            self.close(address);
-        }
     }
 
     fn get_route(&self, address: &Address) -> Option<impl Deref<Target = Route> + '_> {
@@ -443,7 +464,7 @@ impl Table {
         Ok(())
     }
 
-    pub fn send(&self, handle: usize, data: &[u8], caps: &[usize]) -> Result<(), TableError> {
+    pub async fn send(&self, handle: usize, data: &[u8], caps: &[usize]) -> Result<(), TableError> {
         let inner = self.inner.lock();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
 
@@ -457,13 +478,15 @@ impl Table {
             mapped_caps.push(entry.cap);
         }
 
-        self.post.send(
-            &entry.cap.address,
-            Signal::Message {
-                data,
-                caps: &mapped_caps,
-            },
-        );
+        self.post
+            .send(
+                &entry.cap.address,
+                Signal::Message {
+                    data,
+                    caps: &mapped_caps,
+                },
+            )
+            .await;
 
         Ok(())
     }
@@ -537,14 +560,18 @@ impl<'a> CapabilityHandle<'a> {
         self.table.link(self.handle, mailbox)
     }
 
-    pub fn send(&self, data: &[u8], caps: &[&CapabilityHandle]) -> Result<(), TableError> {
+    pub async fn send(
+        &self,
+        data: &[u8],
+        caps: &[&CapabilityHandle<'_>],
+    ) -> Result<(), TableError> {
         let mut mapped_caps = Vec::with_capacity(caps.len());
         for cap in caps.iter() {
             assert!(std::ptr::eq(cap.table, self.table));
             mapped_caps.push(cap.handle);
         }
 
-        self.table.send(self.handle, data, &mapped_caps)
+        self.table.send(self.handle, data, &mapped_caps).await
     }
 
     pub fn kill(&self) -> Result<(), TableError> {
@@ -646,7 +673,7 @@ mod tests {
         let mb_store = MailboxStore::new(&table);
         let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::SEND);
-        ad.send(b"Hello world!", &[]).unwrap();
+        ad.send(b"Hello world!", &[]).await.unwrap();
 
         assert!(mb
             .recv(|s| {
@@ -665,7 +692,7 @@ mod tests {
         let mb_store = MailboxStore::new(&table);
         let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::SEND);
-        ad.send(b"", &[&ad]).unwrap();
+        ad.send(b"", &[&ad]).await.unwrap();
 
         assert!(mb
             .recv(move |s| {
@@ -687,7 +714,7 @@ mod tests {
         assert_eq!(mb.try_recv(|_| ()), Some(None));
 
         let ad = mb.make_capability(Permissions::SEND);
-        ad.send(b"Hello world!", &[]).unwrap();
+        ad.send(b"Hello world!", &[]).await.unwrap();
 
         assert!(mb
             .try_recv(|s| {
@@ -706,7 +733,7 @@ mod tests {
         let mb_store = MailboxStore::new(&table);
         let mb = mb_store.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::empty());
-        let result = ad.send(b"", &[]);
+        let result = ad.send(b"", &[]).await;
         assert_eq!(result, Err(TableError::PermissionDenied));
     }
 

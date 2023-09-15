@@ -31,10 +31,21 @@ use zerocopy::{channel, NonOwningMessage, OwningMessage, Receiver, Sender};
 pub mod zerocopy;
 
 bitflags::bitflags! {
+    /// Permission flags for a capability.
+    ///
+    /// These gate access to fundamental route operations. When choosing the
+    /// permissions for a capability, please follow the principle of least
+    /// privilege for sharing capability access.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct Permissions: u32 {
+        /// The permission to send messages to this capability.
         const SEND = 1 << 0;
+
+        /// The permission to link to this capability and be notified of its
+        /// closure.
         const LINK = 1 << 1;
+
+        /// The permission to kill this capability.
         const KILL = 1 << 2;
     }
 }
@@ -88,12 +99,6 @@ impl OwningMessage for OwnedSignal {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ContextSignal<'a> {
-    Unlink { handle: usize },
-    Message { data: &'a [u8], caps: Vec<usize> },
-}
-
 struct RouteGroup {
     addresses: HashSet<Address>,
     dead: bool,
@@ -140,11 +145,16 @@ impl Clear for Route {
     }
 }
 
+/// Shared signal transport for all of the processes in a shared context.
+///
+/// Instantiate one [PostOffice] per collection of interoperating processes,
+/// and use it in [Table::new] to create a new capability table.
 pub struct PostOffice {
     routes: Pool<Route>,
 }
 
 impl PostOffice {
+    /// Creates a new post office.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             routes: Pool::new(),
@@ -271,6 +281,22 @@ pub(crate) struct Capability {
     pub perms: Permissions,
 }
 
+/// A freestanding capability that is not tied to any [Table].
+///
+/// This can be used to conveniently transfer single capabilities from one
+/// table to another without needing to send and receive messages.
+///
+/// You can get and insert owned capabilities using [Table::get_owned] and
+/// [Table::insert_owned]. Please keep in mind that owned capabilities have
+/// an `Arc<PostOffice>` inside and are thus relatively expensive to clone and
+/// destroy. Minimize their usage in performance-critical code.
+#[derive(Clone)]
+pub struct OwnedCapability {
+    inner: Capability,
+    post: Arc<PostOffice>,
+}
+
+/// An error in performing a capability operation in a [Table].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TableError {
     /// A handle used in this table operation was invalid.
@@ -323,6 +349,24 @@ impl TableInner {
     }
 }
 
+/// Contains unforgeable capabilities, performs operations on them, and moderates
+/// access to them.
+///
+/// Each capability in a [Table] is referenced by an opaque integer handle.
+/// Handles are reference-counted, and are freed when their refcount hits zero.
+///
+/// This struct has low-level operations on capability handles, but unless
+/// you're doing low-level integration of a table into a scripting environment,
+/// you probably want to use [CapabilityHandle] instead, which provides some
+/// higher-level abstraction for handle ownership.
+///
+/// All incoming capabilities to this table are mapped to handles, and identical
+/// capabilities are given owning references to the same handle. If two handles
+/// have the same integer value, then they are identical. Please note that
+/// the equivalence of capabilities is determined by both that capability's
+/// address (the route it actually points to) **AND** its [Permissions]. Two
+/// capabilities can point to the same route but be unequivalent because they
+/// have different permissions, so proceed with caution.
 pub struct Table {
     post: Arc<PostOffice>,
     inner: Mutex<TableInner>,
@@ -352,6 +396,27 @@ impl Table {
         Self::new(self.post.clone())
     }
 
+    /// Gets an [OwnedCapability] by handle.
+    pub fn get_owned(&self, handle: usize) -> Result<OwnedCapability, TableError> {
+        let inner = self
+            .inner
+            .lock()
+            .entries
+            .get(handle)
+            .ok_or(TableError::InvalidHandle)?
+            .cap;
+
+        let post = self.post.clone();
+
+        Ok(OwnedCapability { inner, post })
+    }
+
+    /// Directly inserts an [OwnedCapability] into this table.
+    pub fn insert_owned(&self, cap: OwnedCapability) -> Result<usize, TableError> {
+        assert_eq!(Arc::as_ptr(&self.post), Arc::as_ptr(&cap.post));
+        Ok(self.insert(cap.inner))
+    }
+
     pub(crate) fn insert(&self, cap: Capability) -> usize {
         self.inner.lock().insert(cap)
     }
@@ -367,6 +432,21 @@ impl Table {
             Signal::Message { data, caps } => ContextSignal::Message {
                 data,
                 caps: caps.iter().map(|cap| self.insert(*cap)).collect(),
+            },
+        }
+    }
+
+    pub(crate) fn map_signal_owned(&self, signal: Signal<'_>) -> OwnedContextSignal<'_> {
+        match self.map_signal(signal) {
+            ContextSignal::Unlink { handle } => OwnedContextSignal::Unlink {
+                handle: self.wrap_handle(handle).unwrap(),
+            },
+            ContextSignal::Message { data, caps } => OwnedContextSignal::Message {
+                data: data.to_owned(),
+                caps: caps
+                    .into_iter()
+                    .map(|cap| self.wrap_handle(cap).unwrap())
+                    .collect(),
             },
         }
     }
@@ -388,6 +468,9 @@ impl Table {
         })
     }
 
+    /// Imports a capability to *any* [Mailbox] into this table.
+    ///
+    /// Panics if the mailbox has a different [PostOffice].
     pub fn import(&self, mailbox: &Mailbox, perms: Permissions) -> usize {
         assert_eq!(
             Arc::as_ptr(&self.post),
@@ -400,6 +483,10 @@ impl Table {
         })
     }
 
+    /// Increments the reference count of a capability handle.
+    ///
+    /// If you'd prefer not to do this manually, try using [Table::wrap_handle]
+    /// and relying on [CapabilityHandle]'s `Clone` implementation instead.
     pub fn inc_ref(&self, handle: usize) -> Result<(), TableError> {
         self.inner
             .lock()
@@ -411,6 +498,11 @@ impl Table {
         Ok(())
     }
 
+    /// Decrements the reference count of a capability handle. Removes this
+    /// capability from this table if the reference count hits zero.
+    ///
+    /// If you'd prefer not to do this manually, try using [Table::wrap_handle]
+    /// and relying on [CapabilityHandle]'s `Drop` implementation instead.
     pub fn dec_ref(&self, handle: usize) -> Result<(), TableError> {
         let mut inner = self.inner.lock();
 
@@ -509,6 +601,13 @@ impl Table {
     }
 }
 
+/// A Rust-friendly handle to a capability within a [Table].
+///
+/// This struct's lifetime is tied to the [Table] that it lives within.
+///
+/// Cloning and dropping [CapabilityHandle] automatically increments and
+/// decrements the reference count of the handle index, so there's no need to
+/// manually manage capability ownership while using this struct.
 pub struct CapabilityHandle<'a> {
     table: &'a Table,
     handle: usize,
@@ -584,6 +683,50 @@ impl<'a> CapabilityHandle<'a> {
     }
 }
 
+/// A signal received through [Mailbox::recv] or [Mailbox::try_recv].
+///
+/// This enum is non-owning and facilitates zero-copy signal-sending. For
+/// low-level scripting integrations or performance-sensitive signal handling,
+/// this is fine. If you're not doing any of that, you probably want to use
+/// [Mailbox::recv_owned] and [Mailbox::try_recv_owned] with
+/// [OwnedContextSignal] instead.
+///
+/// Senders of non-owning signals wait for signals to be handled since they own
+/// the signals' memory. Finish dealing with this signal in as quick and as
+/// constant of a time as possible to avoid creating timing attack
+/// vulnerabilities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextSignal<'a> {
+    /// A notification that a capability linked to this mailbox has been killed.
+    ///
+    /// The handle owns a reference to a demoted version of the capability that
+    /// was originally linked with no permission flags.
+    Unlink { handle: usize },
+
+    /// A message from another process.
+    Message { data: &'a [u8], caps: Vec<usize> },
+}
+
+/// An owned signal received through [Mailbox::recv_owned] or [Mailbox::try_recv_owned].
+///
+/// A slower, owning version of [ContextSignal]. The generic lifetime parameter
+/// of this object is tied to the lifetime of the current table and not to the
+/// receiving of the message.
+#[derive(Clone, Debug)]
+pub enum OwnedContextSignal<'a> {
+    /// A notification that a capability linked to this mailbox has been killed.
+    ///
+    /// The handle owns a reference to a demoted version of the capability that
+    /// was originally linked with no permission flags.
+    Unlink { handle: CapabilityHandle<'a> },
+
+    /// A message from another process.
+    Message {
+        data: Vec<u8>,
+        caps: Vec<CapabilityHandle<'a>>,
+    },
+}
+
 pub struct MailboxStore<'a> {
     table: &'a Table,
     group: Arc<Mutex<RouteGroup>>,
@@ -619,6 +762,18 @@ impl<'a> MailboxStore<'a> {
     }
 }
 
+/// A receiver for [ContextSignals][ContextSignal].
+///
+/// Processes create mailboxes in order to receive signals from other processes.
+/// A process can close a mailbox, unlinking it from the other processes, or
+/// a mailbox can be killed by other processes using [Permissions::KILL] on a
+/// mailbox's capability. When a mailbox is killed, all of the other mailboxes
+/// in its [MailboxStore] are killed as well.
+///
+/// To get started using mailboxes, see [Mailbox::recv]. If you don't need to
+/// process zero-copy signals, you can call [Mailbox::recv_owned] instead.
+/// [Mailbox::try_recv] and [Mailbox::try_recv_owned] poll the mailbox for new
+/// signals without blocking.
 pub struct Mailbox<'a> {
     store: &'a MailboxStore<'a>,
     address: Address,
@@ -632,6 +787,12 @@ impl<'a> Drop for Mailbox<'a> {
 }
 
 impl<'a> Mailbox<'a> {
+    /// Receives a single signal from this mailbox.
+    ///
+    /// [ContextSignal] is non-owning, so this function takes a closure to map
+    /// a temporary [ContextSignal] into types of a larger lifetime.
+    ///
+    /// Returns `None` when this mailbox's process has been killed.
     pub async fn recv<T>(&self, mut f: impl FnMut(ContextSignal) -> T) -> Option<T> {
         self.rx
             .recv(|signal| {
@@ -642,6 +803,25 @@ impl<'a> Mailbox<'a> {
             .ok()
     }
 
+    /// Receives a [OwnedContextSignal].
+    ///
+    /// Returns `None` when this mailbox's process has been killed.
+    pub async fn recv_owned(&self) -> Option<OwnedContextSignal<'a>> {
+        self.rx
+            .recv(|signal| self.store.table.map_signal_owned(signal))
+            .await
+            .ok()
+    }
+
+    /// Polls this mailbox for any currently available signals.
+    ///
+    /// [ContextSignal] is non-owning, so this function takes a lambda to map
+    /// a temporary [ContextSignal] into types of a larger lifetime.
+    ///
+    /// Returns:
+    /// - `Some(Some(t))` when there was a signal available and it was mapped by the lambda.
+    /// - `Some(None)` when there was not a signal available.
+    /// - `None` when this mailbox's process has been killed.
     pub fn try_recv<T>(&self, mut f: impl FnMut(ContextSignal) -> T) -> Option<Option<T>> {
         let result = self.rx.try_recv(|signal| {
             let signal = self.store.table.map_signal(signal);
@@ -655,6 +835,25 @@ impl<'a> Mailbox<'a> {
         }
     }
 
+    /// Polls this mailbox for any currently available signals.
+    ///
+    /// Returns:
+    /// - `Some(Some(t))` when there was a signal available.
+    /// - `Some(None)` when there was not a signal available.
+    /// - `None` when this mailbox's process has been killed.
+    pub fn try_recv_owned(&self) -> Option<Option<OwnedContextSignal<'a>>> {
+        let result = self
+            .rx
+            .try_recv(|signal| self.store.table.map_signal_owned(signal));
+
+        match result {
+            Ok(signal) => Some(Some(signal)),
+            Err(flume::TryRecvError::Empty) => Some(None),
+            Err(flume::TryRecvError::Disconnected) => None,
+        }
+    }
+
+    /// Creates a capability within this mailbox's parent table to this mailbox's route.
     pub fn make_capability(&self, perms: Permissions) -> CapabilityHandle<'a> {
         let handle = self.store.table.insert(Capability {
             address: self.address,

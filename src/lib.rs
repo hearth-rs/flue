@@ -649,6 +649,11 @@ impl<'a> CapabilityHandle<'a> {
         handle
     }
 
+    /// Creates a freestanding [OwnedCapability] from this capability handle.
+    pub fn to_owned(&self) -> OwnedCapability {
+        self.table.get_owned(self.handle).unwrap()
+    }
+
     pub fn get_permissions(&self) -> Permissions {
         self.table.get_permissions(self.handle).unwrap()
     }

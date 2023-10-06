@@ -16,6 +16,28 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with Flue. If not, see <https://www.gnu.org/licenses/>.
 
+//! Flue is an efficient and secure actor runtime library.
+//!
+//! The fundamental building block in Flue is the **process**: a concurrent
+//! execution thread with private memory. Processes may only communicate by
+//! passing **signals** between each other. Signals are sent to **routes** and
+//! received using **mailboxes**. **Capabilities** both reference and limit
+//! access to routes using fine-grained permission flags. **Tables** are stores
+//! of integer-addressed, unforgeable capabilities.
+//!
+//! Flue is made for the purpose of efficiently executing potentially untrusted
+//! process code, so to support running that code, Flue's security model has
+//! the following axioms:
+//! - Routes can only be accessed by a process if a capability to that route
+//!   has explicitly been passed to that process in a signal. You may sandbox
+//!   processes on a fine-grained level by limiting which capabilities get
+//!   passed to it.
+//! - Capabilities may only be created from other capabilities with either an
+//!   identical set or a subset of the original's permissions. Permission
+//!   escalation by untrusted processes is impossible.
+
+#![warn(missing_docs)]
+
 use std::{
     collections::{HashMap, HashSet},
     fmt::{Debug, Display},
@@ -50,6 +72,7 @@ bitflags::bitflags! {
     }
 }
 
+/// A non-owning, internal signal using post office addresses.
 #[derive(Clone, Copy, Debug)]
 enum Signal<'a> {
     Unlink {
@@ -75,6 +98,9 @@ impl<'a> NonOwningMessage<'a> for Signal<'a> {
     }
 }
 
+/// An owning, internal signal using post office addresses.
+///
+/// Owning version of [Signal].
 enum OwnedSignal {
     Unlink {
         address: Address,
@@ -99,12 +125,15 @@ impl OwningMessage for OwnedSignal {
     }
 }
 
+/// Shared state for a group of routes that are all killed when any of them
+/// are killed.
 struct RouteGroup {
     addresses: HashSet<Address>,
     dead: bool,
 }
 
 impl RouteGroup {
+    /// Kills this route group exactly once.
     pub fn kill(&mut self, post: &Arc<PostOffice>) {
         if self.dead {
             return;
@@ -118,10 +147,21 @@ impl RouteGroup {
     }
 }
 
+/// A clearable connection to a [Mailbox]. Addressed in [PostOffice] by [Address].
 struct Route {
+    /// A sender to this route's associated [Mailbox].
     tx: Option<Sender<OwnedSignal>>,
+
+    /// The [RouteGroup] that this route is a member of.
     group: Option<Arc<Mutex<RouteGroup>>>,
-    links: Mutex<HashSet<Address>>,
+
+    /// A set of other routes that are linked to this route.
+    ///
+    /// This is taken when this route is closed.
+    links: Mutex<Option<HashSet<Address>>>,
+
+    /// The generation of this route. Routes that are allocated in the [PostOffice]
+    /// with the same address are differentiated by generation.
     generation: u32,
 }
 
@@ -130,7 +170,7 @@ impl Default for Route {
         Self {
             tx: None,
             group: None,
-            links: Mutex::new(HashSet::new()),
+            links: Mutex::new(Some(HashSet::new())),
             generation: 0,
         }
     }
@@ -140,12 +180,18 @@ impl Clear for Route {
     fn clear(&mut self) {
         self.tx.take();
         self.group.take();
-        self.links.lock().clear();
+        self.links.lock().take();
         self.generation += 1;
     }
 }
 
 /// Shared signal transport for all of the processes in a shared context.
+///
+/// Post offices store pools of routes and manage their lifetimes. This includes
+/// sending messages, closing, killing, and linking them between each other.
+///
+/// Processes reference routes by their addresses, which along with
+/// [Permissions] compose a capability.
 ///
 /// Instantiate one [PostOffice] per collection of interoperating processes,
 /// and use it in [Table::new] to create a new capability table.
@@ -161,6 +207,7 @@ impl PostOffice {
         })
     }
 
+    /// Inserts a new route into this post office and returns its new [Address].
     pub(crate) fn insert(&self, tx: Sender<OwnedSignal>, group: Arc<Mutex<RouteGroup>>) -> Address {
         let mut route = self.routes.create().unwrap();
         route.tx = Some(tx);
@@ -172,6 +219,10 @@ impl PostOffice {
         }
     }
 
+    /// Kills this route's route group.
+    ///
+    /// [RouteGroup::kill] calls [Self::close] on all of the route's group's
+    /// members as a side effect of this function.
     pub(crate) fn kill(self: &Arc<Self>, address: &Address) {
         let Some(route) = self.get_route(address) else {
             return;
@@ -180,25 +231,38 @@ impl PostOffice {
         route.group.as_ref().unwrap().lock().kill(self);
     }
 
+    /// Closes a route, frees its entry, and unlinks all routes linked to it.
     pub(crate) fn close(self: &Arc<Self>, address: &Address) {
         let Some(route) = self.get_route(address) else {
             return;
         };
 
+        let Some(links) = route.links.lock().take() else {
+            return;
+        };
+
         let address = *address;
-        let links = route.links.lock().to_owned();
         let post = self.to_owned();
 
+        // unlink asynchronously in order to return in constant time
+        // mitigates timing attacks and eliminates delays in large networks of links
         tokio::spawn(async move {
             for link in links {
                 post.send(&link, Signal::Unlink { address }).await;
             }
         });
 
+        // mark this route for clearing
         self.routes.clear(address.handle);
     }
 
+    /// Sends a signal to a route by address.
+    ///
+    /// This function is async because zero-copy signal sending needs to wait
+    /// for the receiver to finish receiving before the signal's memory can be
+    /// safely destroyed.
     pub(crate) async fn send(self: &Arc<Self>, address: &Address, signal: Signal<'_>) {
+        // nest in block to make this function's future impl Send
         let result = {
             let Some(route) = self.get_route(address) else {
                 return;
@@ -210,9 +274,7 @@ impl PostOffice {
             };
 
             // send signal
-            let result = tx.send(signal);
-
-            result
+            tx.send(signal)
         };
 
         // close this route if the receiver was dropped
@@ -227,8 +289,13 @@ impl PostOffice {
         fut.await;
     }
 
+    /// Links the object route to the subject route.
+    ///
+    /// When the subject route is closed, the object route will receive
+    /// [Signal::Unlink] with the subject's address.
     pub(crate) fn link(self: &Arc<Self>, subject: &Address, object: &Address) {
-        // shorthand to immediately unlink
+        // shorthand to immediately unlink if the route is closed at the
+        // time of linking
         let unlink = || {
             let subject = *subject;
             let object = *object;
@@ -241,23 +308,35 @@ impl PostOffice {
         };
 
         let Some(route) = self.get_route(subject) else {
+            // if the address is invalid, the route must be closed
+            unlink();
+            return;
+        };
+
+        let mut links_lock = route.links.lock();
+        let Some(links) = links_lock.as_mut() else {
+            // if links is taken, the route must be closed
             unlink();
             return;
         };
 
         let Some(tx) = &route.tx else {
+            // if the sender has been removed, the route must be closed
             unlink();
             return;
         };
 
         if tx.receiver_count() == 0 {
+            // if the receiver has hung up, the route must be closed
             unlink();
             return;
         }
 
-        route.links.lock().insert(*object);
+        // insert the link object
+        links.insert(*object);
     }
 
+    /// Internal helper function to look up a route by address (including generation).
     fn get_route(&self, address: &Address) -> Option<impl Deref<Target = Route> + '_> {
         let route = self.routes.get(address.handle)?;
 
@@ -269,12 +348,20 @@ impl PostOffice {
     }
 }
 
+/// An address of a signal route in a [PostOffice].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Address {
-    pub handle: usize,
-    pub generation: u32,
+    /// The index of this route in the post office's route pool.
+    pub(crate) handle: usize,
+
+    /// The generation of this address's handle.
+    pub(crate) generation: u32,
 }
 
+/// A capability to a route in a [PostOffice].
+///
+/// This includes both the [Address] of the route and the [Permissions] of the
+/// operations that can be performed on that route with this capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Capability {
     pub address: Address,
@@ -329,6 +416,8 @@ struct TableInner {
 }
 
 impl TableInner {
+    /// Inserts a [Capability] into this table. Reuses existing capability
+    /// handles and increments their reference count if available.
     pub fn insert(&mut self, cap: Capability) -> usize {
         use std::collections::hash_map::Entry;
         let entry = self.reverse_entries.entry(cap);
@@ -421,6 +510,7 @@ impl Table {
         self.inner.lock().insert(cap)
     }
 
+    /// Imports a table-less [Signal] to a table-local [ContextSignal].
     pub(crate) fn map_signal<'a>(&self, signal: Signal<'a>) -> ContextSignal<'a> {
         match signal {
             Signal::Unlink { address } => ContextSignal::Unlink {
@@ -436,6 +526,7 @@ impl Table {
         }
     }
 
+    /// Imports a table-less [Signal] to a table-local [OwnedContextSignal].
     pub(crate) fn map_signal_owned(&self, signal: Signal<'_>) -> OwnedContextSignal<'_> {
         match self.map_signal(signal) {
             ContextSignal::Unlink { handle } => OwnedContextSignal::Unlink {
@@ -474,7 +565,7 @@ impl Table {
     pub fn import(&self, mailbox: &Mailbox, perms: Permissions) -> usize {
         assert_eq!(
             Arc::as_ptr(&self.post),
-            Arc::as_ptr(&mailbox.store.table.post)
+            Arc::as_ptr(&mailbox.group.table.post)
         );
 
         self.insert(Capability {
@@ -521,6 +612,7 @@ impl Table {
         Ok(())
     }
 
+    /// Retrieves the [Permissions] of a capability handle.
     pub fn get_permissions(&self, handle: usize) -> Result<Permissions, TableError> {
         self.inner
             .lock()
@@ -530,6 +622,10 @@ impl Table {
             .map(|e| e.cap.perms)
     }
 
+    /// Creates a new capability from an existing one with a subset of the original's [Permissions].
+    ///
+    /// Returns [TableError::PermissionDenied] if the permissions requested are
+    /// not in the original's.
     pub fn demote(&self, handle: usize, perms: Permissions) -> Result<usize, TableError> {
         let mut inner = self.inner.lock();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
@@ -543,8 +639,19 @@ impl Table {
         Ok(handle)
     }
 
+    /// Links a capability handle to a given mailbox.
+    ///
+    /// When the capability's route is closed, the mailbox will receive an
+    /// unlink signal ([ContextSignal::Unlink] or [OwnedContextSignal::Unlink])
+    /// with a capability handle of a demoted version of the linked capability
+    /// *but with no [Permissions]*.
+    ///
+    /// Returns [TableError::PermissionDenied] if the capability does not have
+    /// [Permissions::LINK].
+    ///
+    /// Panics if the mailbox's table is not this table.
     pub fn link(&self, handle: usize, mailbox: &Mailbox) -> Result<(), TableError> {
-        assert!(std::ptr::eq(mailbox.store.table, self));
+        assert!(std::ptr::eq(mailbox.group.table, self));
         let inner = self.inner.lock();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
 
@@ -556,6 +663,17 @@ impl Table {
         Ok(())
     }
 
+    /// Sends a message to the given capability handle.
+    ///
+    /// This function is async because zero-copy sending of signals needs to
+    /// wait for the receiver to finish consuming the sent data before returning
+    /// in order to safely capture the lifetime of the data.
+    ///
+    /// Returns [TableError::PermissionDenied] if the destination capability
+    /// does not have [Permissions::SEND].
+    ///
+    /// Returns [TableError::InvalidHandle] if `handle` or any of `caps` are
+    /// invalid within this table.
     pub async fn send(&self, handle: usize, data: &[u8], caps: &[usize]) -> Result<(), TableError> {
         // move into block to make this future Send
         let (address, mapped_caps) = {
@@ -588,6 +706,13 @@ impl Table {
         Ok(())
     }
 
+    /// Kills a capability handle.
+    ///
+    /// This does NOT decrement the reference count of the handle; only
+    /// attempts to kill it.
+    ///
+    /// Returns [TableError::PermissionDenied] if the given capability does not
+    /// have [Permissions::KILL].
     pub fn kill(&self, handle: usize) -> Result<(), TableError> {
         let inner = self.inner.lock();
         let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
@@ -654,10 +779,15 @@ impl<'a> CapabilityHandle<'a> {
         self.table.get_owned(self.handle).unwrap()
     }
 
+    /// Retrieves the [Permissions] of this capability handle.
     pub fn get_permissions(&self) -> Permissions {
         self.table.get_permissions(self.handle).unwrap()
     }
 
+    /// Creates a new [CapabilityHandle] with a subset of the [Permissions] of this one.
+    ///
+    /// Returns [TableError::PermissionDenied] if the permissions requested are
+    /// not in this one's.
     pub fn demote(&self, perms: Permissions) -> Result<Self, TableError> {
         Ok(Self {
             table: self.table,
@@ -665,10 +795,26 @@ impl<'a> CapabilityHandle<'a> {
         })
     }
 
+    /// Links this capability handle to a given mailbox.
+    ///
+    /// When this capability's route is closed, the mailbox will receive an
+    /// unlink signal ([ContextSignal::Unlink] or [OwnedContextSignal::Unlink])
+    /// with a capability handle of a demoted version of this capability *but
+    /// with no [Permissions]*.
+    ///
+    /// Returns [TableError::PermissionDenied] if this capability does not have
+    /// [Permissions::LINK].
+    ///
+    /// Panics if the mailbox's table is not this table.
     pub fn link(&self, mailbox: &Mailbox<'a>) -> Result<(), TableError> {
         self.table.link(self.handle, mailbox)
     }
 
+    /// Sends a message to this capability handle.
+    ///
+    /// This function is async because zero-copy sending of signals needs to
+    /// wait for the receiver to finish consuming the sent data before returning
+    /// in order to safely capture the lifetime of the data.
     pub async fn send(
         &self,
         data: &[u8],
@@ -683,6 +829,10 @@ impl<'a> CapabilityHandle<'a> {
         self.table.send(self.handle, data, &mapped_caps).await
     }
 
+    /// Kills this capability handle.
+    ///
+    /// Returns [TableError::PermissionDenied] if this capability does not have
+    /// [Permissions::KILL].
     pub fn kill(&self) -> Result<(), TableError> {
         self.table.kill(self.handle)
     }
@@ -703,13 +853,20 @@ impl<'a> CapabilityHandle<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContextSignal<'a> {
     /// A notification that a capability linked to this mailbox has been killed.
-    ///
-    /// The handle owns a reference to a demoted version of the capability that
-    /// was originally linked with no permission flags.
-    Unlink { handle: usize },
+    Unlink {
+        /// An owning handle of a demoted version of the capability that was
+        /// originally linked but with no [Permissions].
+        handle: usize,
+    },
 
     /// A message from another process.
-    Message { data: &'a [u8], caps: Vec<usize> },
+    Message {
+        /// This message's data as a raw byte array.
+        data: &'a [u8],
+
+        /// The capabilities sent in this message.
+        caps: Vec<usize>,
+    },
 }
 
 /// An owned signal received through [Mailbox::recv_owned] or [Mailbox::try_recv_owned].
@@ -720,24 +877,41 @@ pub enum ContextSignal<'a> {
 #[derive(Clone, Debug)]
 pub enum OwnedContextSignal<'a> {
     /// A notification that a capability linked to this mailbox has been killed.
-    ///
-    /// The handle owns a reference to a demoted version of the capability that
-    /// was originally linked with no permission flags.
-    Unlink { handle: CapabilityHandle<'a> },
+    Unlink {
+        /// An owning handle of a demoted version of the capability that was
+        /// originally linked but with no [Permissions].
+        handle: CapabilityHandle<'a>,
+    },
 
     /// A message from another process.
     Message {
+        /// This message's data as a raw byte array.
         data: Vec<u8>,
+
+        /// The capabilities sent in this message.
         caps: Vec<CapabilityHandle<'a>>,
     },
 }
 
-pub struct MailboxStore<'a> {
+/// A factory for [Mailbox]s that belong to the same route group.
+///
+/// Create a mailbox group for a table using [MailboxGroup::new], then create
+/// mailboxes using [MailboxGroup::create_mailbox]. When the mailboxes from
+/// this group are killed, you cannot create any more mailboxes. You can check
+/// if this mailbox group is still alive without polling mailboxes using
+/// [MailboxGroup::poll_dead].
+///
+/// There is a one-to-many relationship between [Table] and [MailboxGroup], so
+/// create as many groups as you want. However, in most cases where you're only
+/// executing a single process per [Table], you're only going to need a single
+/// group.
+pub struct MailboxGroup<'a> {
     table: &'a Table,
     group: Arc<Mutex<RouteGroup>>,
 }
 
-impl<'a> MailboxStore<'a> {
+impl<'a> MailboxGroup<'a> {
+    /// Creates a new mailbox group for the given [Table].
     pub fn new(table: &'a Table) -> Self {
         Self {
             table,
@@ -748,6 +922,7 @@ impl<'a> MailboxStore<'a> {
         }
     }
 
+    /// Creates a new mailbox. Returns `None` if this mailbox group has been killed.
     pub fn create_mailbox(&self) -> Option<Mailbox<'_>> {
         let mut group = self.group.lock();
 
@@ -760,10 +935,15 @@ impl<'a> MailboxStore<'a> {
         group.addresses.insert(address);
 
         Some(Mailbox {
-            store: self,
+            group: self,
             address,
             rx,
         })
+    }
+
+    /// Checks if this mailbox group has been killed.
+    pub fn poll_dead(&self) -> bool {
+        self.group.lock().dead
     }
 }
 
@@ -773,21 +953,21 @@ impl<'a> MailboxStore<'a> {
 /// A process can close a mailbox, unlinking it from the other processes, or
 /// a mailbox can be killed by other processes using [Permissions::KILL] on a
 /// mailbox's capability. When a mailbox is killed, all of the other mailboxes
-/// in its [MailboxStore] are killed as well.
+/// in its [MailboxGroup] are killed as well.
 ///
 /// To get started using mailboxes, see [Mailbox::recv]. If you don't need to
 /// process zero-copy signals, you can call [Mailbox::recv_owned] instead.
 /// [Mailbox::try_recv] and [Mailbox::try_recv_owned] poll the mailbox for new
 /// signals without blocking.
 pub struct Mailbox<'a> {
-    store: &'a MailboxStore<'a>,
+    group: &'a MailboxGroup<'a>,
     address: Address,
     rx: Receiver<OwnedSignal>,
 }
 
 impl<'a> Drop for Mailbox<'a> {
     fn drop(&mut self) {
-        self.store.table.post.close(&self.address);
+        self.group.table.post.close(&self.address);
     }
 }
 
@@ -801,7 +981,7 @@ impl<'a> Mailbox<'a> {
     pub async fn recv<T>(&self, mut f: impl FnMut(ContextSignal) -> T) -> Option<T> {
         self.rx
             .recv(|signal| {
-                let signal = self.store.table.map_signal(signal);
+                let signal = self.group.table.map_signal(signal);
                 f(signal)
             })
             .await
@@ -813,7 +993,7 @@ impl<'a> Mailbox<'a> {
     /// Returns `None` when this mailbox's process has been killed.
     pub async fn recv_owned(&self) -> Option<OwnedContextSignal<'a>> {
         self.rx
-            .recv(|signal| self.store.table.map_signal_owned(signal))
+            .recv(|signal| self.group.table.map_signal_owned(signal))
             .await
             .ok()
     }
@@ -829,7 +1009,7 @@ impl<'a> Mailbox<'a> {
     /// - `None` when this mailbox's process has been killed.
     pub fn try_recv<T>(&self, mut f: impl FnMut(ContextSignal) -> T) -> Option<Option<T>> {
         let result = self.rx.try_recv(|signal| {
-            let signal = self.store.table.map_signal(signal);
+            let signal = self.group.table.map_signal(signal);
             f(signal)
         });
 
@@ -849,7 +1029,7 @@ impl<'a> Mailbox<'a> {
     pub fn try_recv_owned(&self) -> Option<Option<OwnedContextSignal<'a>>> {
         let result = self
             .rx
-            .try_recv(|signal| self.store.table.map_signal_owned(signal));
+            .try_recv(|signal| self.group.table.map_signal_owned(signal));
 
         match result {
             Ok(signal) => Some(Some(signal)),
@@ -860,13 +1040,13 @@ impl<'a> Mailbox<'a> {
 
     /// Creates a capability within this mailbox's parent table to this mailbox's route.
     pub fn make_capability(&self, perms: Permissions) -> CapabilityHandle<'a> {
-        let handle = self.store.table.insert(Capability {
+        let handle = self.group.table.insert(Capability {
             address: self.address,
             perms,
         });
 
         CapabilityHandle {
-            table: self.store.table,
+            table: self.group.table,
             handle,
         }
     }
@@ -879,8 +1059,8 @@ mod tests {
     #[tokio::test]
     async fn send_message() {
         let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let mb = group.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::SEND);
         ad.send(b"Hello world!", &[]).await.unwrap();
 
@@ -898,8 +1078,8 @@ mod tests {
     #[tokio::test]
     async fn send_address() {
         let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let mb = group.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::SEND);
         ad.send(b"", &[&ad]).await.unwrap();
 
@@ -919,8 +1099,8 @@ mod tests {
         let table = Table::default();
 
         tokio::spawn(async move {
-            let mb_store = MailboxStore::new(&table);
-            let mb = mb_store.create_mailbox().unwrap();
+            let group = MailboxGroup::new(&table);
+            let mb = group.create_mailbox().unwrap();
             let ad = mb.make_capability(Permissions::SEND);
             ad.send(b"Hello world!", &[]).await.unwrap();
 
@@ -941,8 +1121,8 @@ mod tests {
     #[tokio::test]
     async fn try_recv() {
         let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let mb = group.create_mailbox().unwrap();
 
         assert_eq!(mb.try_recv(|_| ()), Some(None));
 
@@ -963,8 +1143,8 @@ mod tests {
     #[tokio::test]
     async fn deny_send() {
         let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let mb = group.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::empty());
         let result = ad.send(b"", &[]).await;
         assert_eq!(result, Err(TableError::PermissionDenied));
@@ -973,8 +1153,8 @@ mod tests {
     #[tokio::test]
     async fn deny_kill() {
         let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let mb = group.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::empty());
         let result = ad.kill();
         assert_eq!(result, Err(TableError::PermissionDenied));
@@ -983,8 +1163,8 @@ mod tests {
     #[tokio::test]
     async fn deny_link() {
         let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let mb = group.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::empty());
         let result = ad.link(&mb);
         assert_eq!(result, Err(TableError::PermissionDenied));
@@ -993,8 +1173,8 @@ mod tests {
     #[tokio::test]
     async fn deny_demote_escalation() {
         let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let mb = group.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::KILL);
         let result = ad.demote(Permissions::SEND);
         assert_eq!(result.unwrap_err(), TableError::PermissionDenied);
@@ -1003,8 +1183,8 @@ mod tests {
     #[tokio::test]
     async fn kill() {
         let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let mb = group.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::KILL);
         ad.kill().unwrap();
         assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
@@ -1013,8 +1193,8 @@ mod tests {
     #[tokio::test]
     async fn double_kill() {
         let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let mb = group.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::KILL);
         ad.kill().unwrap();
         ad.kill().unwrap();
@@ -1024,8 +1204,8 @@ mod tests {
     #[tokio::test]
     async fn dropped_handles_are_freed() {
         let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let mb = group.create_mailbox().unwrap();
         let ad = mb.make_capability(Permissions::empty());
         let handle = ad.handle;
         assert!(table.is_valid(handle));
@@ -1036,9 +1216,9 @@ mod tests {
     #[tokio::test]
     async fn kill_all_mailboxes() {
         let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb1 = mb_store.create_mailbox().unwrap();
-        let mb2 = mb_store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let mb1 = group.create_mailbox().unwrap();
+        let mb2 = group.create_mailbox().unwrap();
         let ad = mb1.make_capability(Permissions::KILL);
         ad.kill().unwrap();
         assert_eq!(mb2.recv(|s| format!("{:?}", s)).await, None);
@@ -1047,12 +1227,12 @@ mod tests {
     #[tokio::test]
     async fn unlink_on_kill() {
         let table = Table::default();
-        let o_store = MailboxStore::new(&table);
-        let object = o_store.create_mailbox().unwrap();
+        let o_group = MailboxGroup::new(&table);
+        let object = o_group.create_mailbox().unwrap();
 
         let child = table.spawn();
-        let s_store = MailboxStore::new(&child);
-        let s_mb = s_store.create_mailbox().unwrap();
+        let s_group = MailboxGroup::new(&child);
+        let s_mb = s_group.create_mailbox().unwrap();
 
         let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
 
@@ -1074,10 +1254,10 @@ mod tests {
     #[tokio::test]
     async fn unlink_on_close() {
         let table = Table::default();
-        let store = MailboxStore::new(&table);
-        let s_mb = store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let s_mb = group.create_mailbox().unwrap();
         let s_cap = s_mb.make_capability(Permissions::LINK);
-        let object = store.create_mailbox().unwrap();
+        let object = group.create_mailbox().unwrap();
         s_cap.link(&object).unwrap();
         drop(s_mb);
 
@@ -1091,12 +1271,12 @@ mod tests {
     #[tokio::test]
     async fn unlink_dead() {
         let table = Table::default();
-        let o_store = MailboxStore::new(&table);
-        let object = o_store.create_mailbox().unwrap();
+        let o_group = MailboxGroup::new(&table);
+        let object = o_group.create_mailbox().unwrap();
 
         let child = table.spawn();
-        let s_store = MailboxStore::new(&child);
-        let s_mb = s_store.create_mailbox().unwrap();
+        let s_group = MailboxGroup::new(&child);
+        let s_mb = s_group.create_mailbox().unwrap();
 
         let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
 
@@ -1118,10 +1298,10 @@ mod tests {
     #[tokio::test]
     async fn unlink_closed() {
         let table = Table::default();
-        let store = MailboxStore::new(&table);
-        let s_mb = store.create_mailbox().unwrap();
+        let group = MailboxGroup::new(&table);
+        let s_mb = group.create_mailbox().unwrap();
         let s_cap = s_mb.make_capability(Permissions::LINK);
-        let object = store.create_mailbox().unwrap();
+        let object = group.create_mailbox().unwrap();
         drop(s_mb);
         s_cap.link(&object).unwrap();
 

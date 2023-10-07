@@ -21,7 +21,9 @@
 //! The fundamental building block in Flue is the **process**: a concurrent
 //! execution thread with private memory. Processes may only communicate by
 //! passing **signals** between each other. Signals are sent to **routes** and
-//! received using **mailboxes**. **Capabilities** both reference and limit
+//! received using **mailboxes**. All routes in a **route group** are killed if
+//! any of them are killed. The **post office** contains all of the routes in a
+//! set of communicating processes. **Capabilities** both reference and limit
 //! access to routes using fine-grained permission flags. **Tables** are stores
 //! of integer-addressed, unforgeable capabilities.
 //!
@@ -30,11 +32,55 @@
 //! the following axioms:
 //! - Routes can only be accessed by a process if a capability to that route
 //!   has explicitly been passed to that process in a signal. You may sandbox
-//!   processes on a fine-grained level by limiting which capabilities get
+//!   a process on a fine-grained level by limiting which capabilities get
 //!   passed to it.
 //! - Capabilities may only be created from other capabilities with either an
 //!   identical set or a subset of the original's permissions. Permission
 //!   escalation by untrusted processes is impossible.
+//!
+//! Here's a box diagram of two processes who each have a mailbox and a
+//! capability to the other's mailbox to help explain the mental model of a
+//! full Flue-based actor system:
+//!
+//! ```
+//!         Process A               Post Office               Process B
+//! ┌───────────────────────┐     ┌─────────────┐     ┌───────────────────────┐
+//! │         Table         │     │             │     │         Table         │
+//! │ ┌───────────────────┐ │     │ ┌─────────┐ │     │ ┌───────────────────┐ │
+//! │ │                   │ │     │ │         │ │     │ │                   │ │
+//! │ │ ┌───────────────┐ │ │  ┌──┼─► Route B ├─┼───┐ │ │ ┌───────────────┐ │ │
+//! │ │ │ Capability A  ├─┼─┼──┘  │ │         │ │   │ │ │ │ Capability B  ├─┼─┼─┐
+//! │ │ └───────────────┘ │ │     │ └─────────┘ │   │ │ │ └───────────────┘ │ │ │
+//! │ │                   │ │     │             │   │ │ │                   │ │ │
+//! │ └────────▲──────────┘ │     │ ┌─────────┐ │   │ │ └────────▲──────────┘ │ │
+//! │          │            │     │ │         │ │   │ │          │            │ │
+//! │   ┌──────┴───────┐    │  ┌──┼─┤ Route A ◄─┼─┐ │ │   ┌──────┴───────┐    │ │
+//! │   │   Mailbox A  ◄────┼──┘  │ │         │ │ │ └─┼───►   Mailbox B  │    │ │
+//! │   └──────────────┘    │     │ └─────────┘ │ │   │   └──────────────┘    │ │
+//! │                       │     │             │ │   │                       │ │
+//! └───────────────────────┘     └─────────────┘ │   └───────────────────────┘ │
+//!                                               │                             │
+//!                                               └─────────────────────────────┘
+//! ```
+//!
+//! Both processes share a post office, and mailboxes A and B have associated
+//! routes A and B in that mailbox. Capability A belongs in process A's table
+//! and references route B, and capability B lives in process B's table and
+//! references route A. Mailboxes A and B reference their associated process's
+//! table so that when they receive capabilities, they can insert those
+//! capabilities into their process's table.
+//!
+//! To send a message signal from process A to process B using capability A,
+//! Flue performs the following steps on that message:
+//! 1. Process A's table confirms that capability A does indeed have the
+//!    permission to send messages.
+//! 2. Process A's table sends the message to route B's address in the post
+//!    office.
+//! 3. The post office looks up route B by address, finds mailbox B's zero-copy
+//!    message channel, and uses it to send the message.
+//! 4. The message waits in mailbox B's queue until mailbox B receives it.
+//! 5. Mailbox B processes the message and inserts any capabilities inside of
+//!    it into process B's mailbox.
 
 #![warn(missing_docs)]
 
@@ -410,6 +456,9 @@ struct TableEntry {
     refs: usize,
 }
 
+/// Mutable state in a [Table]. Stores the table's capabilities, their
+/// reference counts, and a capability-keyed reverse lookup table of existing
+/// entries.
 struct TableInner {
     entries: Slab<TableEntry>,
     reverse_entries: HashMap<Capability, usize>,

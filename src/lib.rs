@@ -80,7 +80,7 @@
 //!    message channel, and uses it to send the message.
 //! 4. The message waits in mailbox B's queue until mailbox B receives it.
 //! 5. Mailbox B processes the message and inserts any capabilities inside of
-//!    it into process B's mailbox.
+//!    it into process B's table.
 
 #![warn(missing_docs)]
 

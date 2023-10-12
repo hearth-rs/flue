@@ -122,7 +122,7 @@ bitflags::bitflags! {
 #[derive(Clone, Copy, Debug)]
 enum Signal<'a> {
     Unlink {
-        address: Address,
+        address: RouteAddress,
     },
     Message {
         data: &'a [u8],
@@ -149,7 +149,7 @@ impl<'a> NonOwningMessage<'a> for Signal<'a> {
 /// Owning version of [Signal].
 enum OwnedSignal {
     Unlink {
-        address: Address,
+        address: RouteAddress,
     },
     Message {
         data: Vec<u8>,
@@ -174,7 +174,7 @@ impl OwningMessage for OwnedSignal {
 /// Shared state for a group of routes that are all killed when any of them
 /// are killed.
 struct RouteGroup {
-    addresses: HashSet<Address>,
+    addresses: HashSet<RouteAddress>,
     dead: bool,
 }
 
@@ -193,7 +193,7 @@ impl RouteGroup {
     }
 }
 
-/// A clearable connection to a [Mailbox]. Addressed in [PostOffice] by [Address].
+/// A clearable connection to a [Mailbox]. Addressed in [PostOffice] by [RouteAddress].
 struct Route {
     /// A sender to this route's associated [Mailbox].
     tx: Option<Sender<OwnedSignal>>,
@@ -204,7 +204,7 @@ struct Route {
     /// A set of other routes that are linked to this route.
     ///
     /// This is taken when this route is closed.
-    links: Mutex<Option<HashSet<Address>>>,
+    links: Mutex<Option<HashSet<RouteAddress>>>,
 
     /// The generation of this route. Routes that are allocated in the [PostOffice]
     /// with the same address are differentiated by generation.
@@ -253,13 +253,17 @@ impl PostOffice {
         })
     }
 
-    /// Inserts a new route into this post office and returns its new [Address].
-    pub(crate) fn insert(&self, tx: Sender<OwnedSignal>, group: Arc<Mutex<RouteGroup>>) -> Address {
+    /// Inserts a new route into this post office and returns its new [RouteAddress].
+    pub(crate) fn insert(
+        &self,
+        tx: Sender<OwnedSignal>,
+        group: Arc<Mutex<RouteGroup>>,
+    ) -> RouteAddress {
         let mut route = self.routes.create().unwrap();
         route.tx = Some(tx);
         route.group = Some(group);
 
-        Address {
+        RouteAddress {
             handle: route.key(),
             generation: route.generation,
         }
@@ -269,7 +273,7 @@ impl PostOffice {
     ///
     /// [RouteGroup::kill] calls [Self::close] on all of the route's group's
     /// members as a side effect of this function.
-    pub(crate) fn kill(self: &Arc<Self>, address: &Address) {
+    pub(crate) fn kill(self: &Arc<Self>, address: &RouteAddress) {
         let Some(route) = self.get_route(address) else {
             return;
         };
@@ -278,7 +282,7 @@ impl PostOffice {
     }
 
     /// Closes a route, frees its entry, and unlinks all routes linked to it.
-    pub(crate) fn close(self: &Arc<Self>, address: &Address) {
+    pub(crate) fn close(self: &Arc<Self>, address: &RouteAddress) {
         let Some(route) = self.get_route(address) else {
             return;
         };
@@ -307,7 +311,7 @@ impl PostOffice {
     /// This function is async because zero-copy signal sending needs to wait
     /// for the receiver to finish receiving before the signal's memory can be
     /// safely destroyed.
-    pub(crate) async fn send(self: &Arc<Self>, address: &Address, signal: Signal<'_>) {
+    pub(crate) async fn send(self: &Arc<Self>, address: &RouteAddress, signal: Signal<'_>) {
         // nest in block to make this function's future impl Send
         let result = {
             let Some(route) = self.get_route(address) else {
@@ -339,7 +343,7 @@ impl PostOffice {
     ///
     /// When the subject route is closed, the object route will receive
     /// [Signal::Unlink] with the subject's address.
-    pub(crate) fn link(self: &Arc<Self>, subject: &Address, object: &Address) {
+    pub(crate) fn link(self: &Arc<Self>, subject: &RouteAddress, object: &RouteAddress) {
         // shorthand to immediately unlink if the route is closed at the
         // time of linking
         let unlink = || {
@@ -383,7 +387,7 @@ impl PostOffice {
     }
 
     /// Internal helper function to look up a route by address (including generation).
-    fn get_route(&self, address: &Address) -> Option<impl Deref<Target = Route> + '_> {
+    fn get_route(&self, address: &RouteAddress) -> Option<impl Deref<Target = Route> + '_> {
         let route = self.routes.get(address.handle)?;
 
         if route.generation != address.generation {
@@ -396,7 +400,7 @@ impl PostOffice {
 
 /// An address of a signal route in a [PostOffice].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Address {
+pub(crate) struct RouteAddress {
     /// The index of this route in the post office's route pool.
     pub(crate) handle: usize,
 
@@ -406,11 +410,11 @@ pub(crate) struct Address {
 
 /// A capability to a route in a [PostOffice].
 ///
-/// This includes both the [Address] of the route and the [Permissions] of the
+/// This includes both the [RouteAddress] of the route and the [Permissions] of the
 /// operations that can be performed on that route with this capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Capability {
-    pub address: Address,
+    pub address: RouteAddress,
     pub perms: Permissions,
 }
 
@@ -864,11 +868,7 @@ impl<'a> CapabilityRef<'a> {
     /// This function is async because zero-copy sending of signals needs to
     /// wait for the receiver to finish consuming the sent data before returning
     /// in order to safely capture the lifetime of the data.
-    pub async fn send(
-        &self,
-        data: &[u8],
-        caps: &[&CapabilityRef<'_>],
-    ) -> Result<(), TableError> {
+    pub async fn send(&self, data: &[u8], caps: &[&CapabilityRef<'_>]) -> Result<(), TableError> {
         let mut mapped_caps = Vec::with_capacity(caps.len());
         for cap in caps.iter() {
             assert!(std::ptr::eq(cap.table, self.table));
@@ -1010,7 +1010,7 @@ impl<'a> MailboxGroup<'a> {
 /// signals without blocking.
 pub struct Mailbox<'a> {
     group: &'a MailboxGroup<'a>,
-    address: Address,
+    address: RouteAddress,
     rx: Receiver<OwnedSignal>,
 }
 

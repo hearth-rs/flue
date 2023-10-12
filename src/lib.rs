@@ -495,7 +495,7 @@ impl TableInner {
 ///
 /// This struct has low-level operations on capability handles, but unless
 /// you're doing low-level integration of a table into a scripting environment,
-/// you probably want to use [CapabilityHandle] instead, which provides some
+/// you probably want to use [CapabilityRef] instead, which provides some
 /// higher-level abstraction for handle ownership.
 ///
 /// All incoming capabilities to this table are mapped to handles, and identical
@@ -596,13 +596,13 @@ impl Table {
         self.inner.lock().entries.contains(handle)
     }
 
-    /// Wraps a raw capability handle in a Rust-friendly [CapabilityHandle] struct.
-    pub fn wrap_handle(&self, handle: usize) -> Result<CapabilityHandle, TableError> {
+    /// Wraps a raw capability handle in a Rust-friendly [CapabilityRef] struct.
+    pub fn wrap_handle(&self, handle: usize) -> Result<CapabilityRef, TableError> {
         if !self.is_valid(handle) {
             return Err(TableError::InvalidHandle);
         }
 
-        Ok(CapabilityHandle {
+        Ok(CapabilityRef {
             table: self,
             handle,
         })
@@ -626,7 +626,7 @@ impl Table {
     /// Increments the reference count of a capability handle.
     ///
     /// If you'd prefer not to do this manually, try using [Table::wrap_handle]
-    /// and relying on [CapabilityHandle]'s `Clone` implementation instead.
+    /// and relying on [CapabilityRef]'s `Clone` implementation instead.
     pub fn inc_ref(&self, handle: usize) -> Result<(), TableError> {
         self.inner
             .lock()
@@ -642,7 +642,7 @@ impl Table {
     /// capability from this table if the reference count hits zero.
     ///
     /// If you'd prefer not to do this manually, try using [Table::wrap_handle]
-    /// and relying on [CapabilityHandle]'s `Drop` implementation instead.
+    /// and relying on [CapabilityRef]'s `Drop` implementation instead.
     pub fn dec_ref(&self, handle: usize) -> Result<(), TableError> {
         let mut inner = self.inner.lock();
 
@@ -779,15 +779,15 @@ impl Table {
 ///
 /// This struct's lifetime is tied to the [Table] that it lives within.
 ///
-/// Cloning and dropping [CapabilityHandle] automatically increments and
+/// Cloning and dropping [CapabilityRef] automatically increments and
 /// decrements the reference count of the handle index, so there's no need to
 /// manually manage capability ownership while using this struct.
-pub struct CapabilityHandle<'a> {
+pub struct CapabilityRef<'a> {
     table: &'a Table,
     handle: usize,
 }
 
-impl<'a> Clone for CapabilityHandle<'a> {
+impl<'a> Clone for CapabilityRef<'a> {
     fn clone(&self) -> Self {
         self.table.inc_ref(self.handle).unwrap();
 
@@ -798,21 +798,21 @@ impl<'a> Clone for CapabilityHandle<'a> {
     }
 }
 
-impl<'a> Debug for CapabilityHandle<'a> {
+impl<'a> Debug for CapabilityRef<'a> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-        fmt.debug_tuple("CapabilityHandle")
+        fmt.debug_tuple("CapabilityRef")
             .field(&self.handle)
             .finish()
     }
 }
 
-impl<'a> Drop for CapabilityHandle<'a> {
+impl<'a> Drop for CapabilityRef<'a> {
     fn drop(&mut self) {
         self.table.dec_ref(self.handle).unwrap();
     }
 }
 
-impl<'a> CapabilityHandle<'a> {
+impl<'a> CapabilityRef<'a> {
     /// Converts this handle wrapper into a raw handle index.
     ///
     /// You should call [Table::dec_ref] when you're done with this raw handle
@@ -833,7 +833,7 @@ impl<'a> CapabilityHandle<'a> {
         self.table.get_permissions(self.handle).unwrap()
     }
 
-    /// Creates a new [CapabilityHandle] with a subset of the [Permissions] of this one.
+    /// Creates a new [CapabilityRef] with a subset of the [Permissions] of this one.
     ///
     /// Returns [TableError::PermissionDenied] if the permissions requested are
     /// not in this one's.
@@ -867,7 +867,7 @@ impl<'a> CapabilityHandle<'a> {
     pub async fn send(
         &self,
         data: &[u8],
-        caps: &[&CapabilityHandle<'_>],
+        caps: &[&CapabilityRef<'_>],
     ) -> Result<(), TableError> {
         let mut mapped_caps = Vec::with_capacity(caps.len());
         for cap in caps.iter() {
@@ -929,7 +929,7 @@ pub enum OwnedContextSignal<'a> {
     Unlink {
         /// An owning handle of a demoted version of the capability that was
         /// originally linked but with no [Permissions].
-        handle: CapabilityHandle<'a>,
+        handle: CapabilityRef<'a>,
     },
 
     /// A message from another process.
@@ -938,7 +938,7 @@ pub enum OwnedContextSignal<'a> {
         data: Vec<u8>,
 
         /// The capabilities sent in this message.
-        caps: Vec<CapabilityHandle<'a>>,
+        caps: Vec<CapabilityRef<'a>>,
     },
 }
 
@@ -1088,13 +1088,13 @@ impl<'a> Mailbox<'a> {
     }
 
     /// Creates a capability within this mailbox's parent table to this mailbox's route.
-    pub fn make_capability(&self, perms: Permissions) -> CapabilityHandle<'a> {
+    pub fn make_capability(&self, perms: Permissions) -> CapabilityRef<'a> {
         let handle = self.group.table.insert(Capability {
             address: self.address,
             perms,
         });
 
-        CapabilityHandle {
+        CapabilityRef {
             table: self.group.table,
             handle,
         }
@@ -1285,7 +1285,7 @@ mod tests {
 
         let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
 
-        let s_cap = CapabilityHandle {
+        let s_cap = CapabilityRef {
             table: &table,
             handle: s_handle,
         };
@@ -1329,7 +1329,7 @@ mod tests {
 
         let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
 
-        let s_cap = CapabilityHandle {
+        let s_cap = CapabilityRef {
             table: &table,
             handle: s_handle,
         };

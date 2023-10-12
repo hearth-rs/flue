@@ -465,7 +465,7 @@ impl std::error::Error for TableError {}
 #[derive(Debug)]
 struct TableEntry {
     cap: Capability,
-    refs: usize,
+    ref_count: usize,
 }
 
 /// Mutable state in a [Table]. Stores the table's capabilities, their
@@ -485,12 +485,12 @@ impl TableInner {
         match entry {
             Entry::Occupied(handle) => {
                 let handle = *handle.get();
-                self.entries.get_mut(handle.0).unwrap().refs += 1;
+                self.entries.get_mut(handle.0).unwrap().ref_count += 1;
                 handle
             }
             Entry::Vacant(reverse_entry) => {
-                let refs = 1;
-                let entry = TableEntry { cap, refs };
+                let ref_count = 1;
+                let entry = TableEntry { cap, ref_count };
                 let handle = self.entries.insert(entry);
                 reverse_entry.insert(CapabilityHandle(handle));
                 CapabilityHandle(handle)
@@ -652,7 +652,7 @@ impl Table {
             .entries
             .get_mut(handle.0)
             .ok_or(TableError::InvalidHandle)?
-            .refs += 1;
+            .ref_count += 1;
 
         Ok(())
     }
@@ -670,8 +670,8 @@ impl Table {
             .get_mut(handle.0)
             .ok_or(TableError::InvalidHandle)?;
 
-        if entry.refs > 1 {
-            entry.refs -= 1;
+        if entry.ref_count > 1 {
+            entry.ref_count -= 1;
         } else {
             let entry = inner.entries.remove(handle.0);
             inner.reverse_entries.remove(&entry.cap);

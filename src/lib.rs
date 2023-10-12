@@ -409,10 +409,10 @@ impl PostOffice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RouteAddress {
     /// The index of this route in the post office's route pool.
-    pub(crate) handle: RouteHandle,
+    pub handle: RouteHandle,
 
     /// The generation of this address's handle.
-    pub(crate) generation: u32,
+    pub generation: u32,
 }
 
 /// A capability to a route in a [PostOffice].

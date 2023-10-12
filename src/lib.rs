@@ -231,7 +231,7 @@ impl Clear for Route {
     }
 }
 
-/// A handle to a route
+/// A handle to a route.
 ///
 /// Routes are stored in the [PostOffice]'s pool and are indexed by a `usize`.
 /// This struct is used to store the handle of a route in its corresponding [RouteAddress].
@@ -472,31 +472,38 @@ struct TableEntry {
 /// entries.
 struct TableInner {
     entries: Slab<TableEntry>,
-    reverse_entries: HashMap<Capability, usize>,
+    reverse_entries: HashMap<Capability, CapabilityHandle>,
 }
 
 impl TableInner {
     /// Inserts a [Capability] into this table. Reuses existing capability
     /// handles and increments their reference count if available.
-    pub fn insert(&mut self, cap: Capability) -> usize {
+    pub fn insert(&mut self, cap: Capability) -> CapabilityHandle {
         use std::collections::hash_map::Entry;
         let entry = self.reverse_entries.entry(cap);
         match entry {
             Entry::Occupied(handle) => {
                 let handle = *handle.get();
-                self.entries.get_mut(handle).unwrap().refs += 1;
+                self.entries.get_mut(handle.0).unwrap().refs += 1;
                 handle
             }
             Entry::Vacant(reverse_entry) => {
                 let refs = 1;
                 let entry = TableEntry { cap, refs };
                 let handle = self.entries.insert(entry);
-                reverse_entry.insert(handle);
-                handle
+                reverse_entry.insert(CapabilityHandle(handle));
+                CapabilityHandle(handle)
             }
         }
     }
 }
+
+/// A handle to a Capability.
+///
+/// Capabilities are stored in the [TableInner]'s slab. They are indexed by a
+/// `usize`. Outisde of the slab the `usize` is referred to by this type alias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapabilityHandle(usize);
 
 /// Contains unforgeable capabilities, performs operations on them, and moderates
 /// access to them.
@@ -546,12 +553,12 @@ impl Table {
     }
 
     /// Gets an [OwnedCapability] by handle.
-    pub fn get_owned(&self, handle: usize) -> Result<OwnedCapability, TableError> {
+    pub fn get_owned(&self, handle: CapabilityHandle) -> Result<OwnedCapability, TableError> {
         let inner = self
             .inner
             .lock()
             .entries
-            .get(handle)
+            .get(handle.0)
             .ok_or(TableError::InvalidHandle)?
             .cap;
 
@@ -561,12 +568,12 @@ impl Table {
     }
 
     /// Directly inserts an [OwnedCapability] into this table.
-    pub fn insert_owned(&self, cap: OwnedCapability) -> Result<usize, TableError> {
+    pub fn insert_owned(&self, cap: OwnedCapability) -> Result<CapabilityHandle, TableError> {
         assert_eq!(Arc::as_ptr(&self.post), Arc::as_ptr(&cap.post));
-        Ok(self.insert(cap.inner))
+        Ok(CapabilityHandle(self.insert(cap.inner).0))
     }
 
-    pub(crate) fn insert(&self, cap: Capability) -> usize {
+    pub(crate) fn insert(&self, cap: Capability) -> CapabilityHandle {
         self.inner.lock().insert(cap)
     }
 
@@ -603,12 +610,12 @@ impl Table {
     }
 
     /// Tests if a raw capability handle is valid within this table.
-    pub fn is_valid(&self, handle: usize) -> bool {
-        self.inner.lock().entries.contains(handle)
+    pub fn is_valid(&self, handle: CapabilityHandle) -> bool {
+        self.inner.lock().entries.contains(handle.0)
     }
 
     /// Wraps a raw capability handle in a Rust-friendly [CapabilityRef] struct.
-    pub fn wrap_handle(&self, handle: usize) -> Result<CapabilityRef, TableError> {
+    pub fn wrap_handle(&self, handle: CapabilityHandle) -> Result<CapabilityRef, TableError> {
         if !self.is_valid(handle) {
             return Err(TableError::InvalidHandle);
         }
@@ -622,7 +629,7 @@ impl Table {
     /// Imports a capability to *any* [Mailbox] into this table.
     ///
     /// Panics if the mailbox has a different [PostOffice].
-    pub fn import(&self, mailbox: &Mailbox, perms: Permissions) -> usize {
+    pub fn import(&self, mailbox: &Mailbox, perms: Permissions) -> CapabilityHandle {
         assert_eq!(
             Arc::as_ptr(&self.post),
             Arc::as_ptr(&mailbox.group.table.post)
@@ -638,11 +645,11 @@ impl Table {
     ///
     /// If you'd prefer not to do this manually, try using [Table::wrap_handle]
     /// and relying on [CapabilityRef]'s `Clone` implementation instead.
-    pub fn inc_ref(&self, handle: usize) -> Result<(), TableError> {
+    pub fn inc_ref(&self, handle: CapabilityHandle) -> Result<(), TableError> {
         self.inner
             .lock()
             .entries
-            .get_mut(handle)
+            .get_mut(handle.0)
             .ok_or(TableError::InvalidHandle)?
             .refs += 1;
 
@@ -654,18 +661,18 @@ impl Table {
     ///
     /// If you'd prefer not to do this manually, try using [Table::wrap_handle]
     /// and relying on [CapabilityRef]'s `Drop` implementation instead.
-    pub fn dec_ref(&self, handle: usize) -> Result<(), TableError> {
+    pub fn dec_ref(&self, handle: CapabilityHandle) -> Result<(), TableError> {
         let mut inner = self.inner.lock();
 
         let entry = inner
             .entries
-            .get_mut(handle)
+            .get_mut(handle.0)
             .ok_or(TableError::InvalidHandle)?;
 
         if entry.refs > 1 {
             entry.refs -= 1;
         } else {
-            let entry = inner.entries.remove(handle);
+            let entry = inner.entries.remove(handle.0);
             inner.reverse_entries.remove(&entry.cap);
         }
 
@@ -673,11 +680,11 @@ impl Table {
     }
 
     /// Retrieves the [Permissions] of a capability handle.
-    pub fn get_permissions(&self, handle: usize) -> Result<Permissions, TableError> {
+    pub fn get_permissions(&self, handle: CapabilityHandle) -> Result<Permissions, TableError> {
         self.inner
             .lock()
             .entries
-            .get(handle)
+            .get(handle.0)
             .ok_or(TableError::InvalidHandle)
             .map(|e| e.cap.perms)
     }
@@ -686,9 +693,16 @@ impl Table {
     ///
     /// Returns [TableError::PermissionDenied] if the permissions requested are
     /// not in the original's.
-    pub fn demote(&self, handle: usize, perms: Permissions) -> Result<usize, TableError> {
+    pub fn demote(
+        &self,
+        handle: CapabilityHandle,
+        perms: Permissions,
+    ) -> Result<CapabilityHandle, TableError> {
         let mut inner = self.inner.lock();
-        let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+        let entry = inner
+            .entries
+            .get(handle.0)
+            .ok_or(TableError::InvalidHandle)?;
         let address = entry.cap.address;
 
         if !entry.cap.perms.contains(perms) {
@@ -710,10 +724,13 @@ impl Table {
     /// [Permissions::LINK].
     ///
     /// Panics if the mailbox's table is not this table.
-    pub fn link(&self, handle: usize, mailbox: &Mailbox) -> Result<(), TableError> {
+    pub fn link(&self, handle: CapabilityHandle, mailbox: &Mailbox) -> Result<(), TableError> {
         assert!(std::ptr::eq(mailbox.group.table, self));
         let inner = self.inner.lock();
-        let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+        let entry = inner
+            .entries
+            .get(handle.0)
+            .ok_or(TableError::InvalidHandle)?;
 
         if !entry.cap.perms.contains(Permissions::LINK) {
             return Err(TableError::PermissionDenied);
@@ -734,11 +751,19 @@ impl Table {
     ///
     /// Returns [TableError::InvalidHandle] if `handle` or any of `caps` are
     /// invalid within this table.
-    pub async fn send(&self, handle: usize, data: &[u8], caps: &[usize]) -> Result<(), TableError> {
+    pub async fn send(
+        &self,
+        handle: CapabilityHandle,
+        data: &[u8],
+        caps: &[CapabilityHandle],
+    ) -> Result<(), TableError> {
         // move into block to make this future Send
         let (address, mapped_caps) = {
             let inner = self.inner.lock();
-            let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+            let entry = inner
+                .entries
+                .get(handle.0)
+                .ok_or(TableError::InvalidHandle)?;
 
             if !entry.cap.perms.contains(Permissions::SEND) {
                 return Err(TableError::PermissionDenied);
@@ -746,7 +771,7 @@ impl Table {
 
             let mut mapped_caps = Vec::with_capacity(caps.len());
             for cap in caps.iter() {
-                let entry = inner.entries.get(*cap).ok_or(TableError::InvalidHandle)?;
+                let entry = inner.entries.get(cap.0).ok_or(TableError::InvalidHandle)?;
                 mapped_caps.push(entry.cap);
             }
 
@@ -773,9 +798,12 @@ impl Table {
     ///
     /// Returns [TableError::PermissionDenied] if the given capability does not
     /// have [Permissions::KILL].
-    pub fn kill(&self, handle: usize) -> Result<(), TableError> {
+    pub fn kill(&self, handle: CapabilityHandle) -> Result<(), TableError> {
         let inner = self.inner.lock();
-        let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+        let entry = inner
+            .entries
+            .get(handle.0)
+            .ok_or(TableError::InvalidHandle)?;
 
         if !entry.cap.perms.contains(Permissions::KILL) {
             return Err(TableError::PermissionDenied);
@@ -795,7 +823,7 @@ impl Table {
 /// manually manage capability ownership while using this struct.
 pub struct CapabilityRef<'a> {
     table: &'a Table,
-    handle: usize,
+    handle: CapabilityHandle,
 }
 
 impl<'a> Clone for CapabilityRef<'a> {
@@ -828,7 +856,7 @@ impl<'a> CapabilityRef<'a> {
     ///
     /// You should call [Table::dec_ref] when you're done with this raw handle
     /// to avoid resource leaks.
-    pub fn into_handle(self) -> usize {
+    pub fn into_handle(self) -> CapabilityHandle {
         let handle = self.handle;
         std::mem::forget(self);
         handle
@@ -912,7 +940,7 @@ pub enum ContextSignal<'a> {
     Unlink {
         /// An owning handle of a demoted version of the capability that was
         /// originally linked but with no [Permissions].
-        handle: usize,
+        handle: CapabilityHandle,
     },
 
     /// A message from another process.
@@ -921,7 +949,7 @@ pub enum ContextSignal<'a> {
         data: &'a [u8],
 
         /// The capabilities sent in this message.
-        caps: Vec<usize>,
+        caps: Vec<CapabilityHandle>,
     },
 }
 

@@ -231,6 +231,13 @@ impl Clear for Route {
     }
 }
 
+/// A handle to a route
+///
+/// Routes are stored in the [PostOffice]'s pool and are indexed by a `usize`.
+/// This struct is used to store the handle of a route in its corresponding [RouteAddress].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct RouteHandle(usize);
+
 /// Shared signal transport for all of the processes in a shared context.
 ///
 /// Post offices store pools of routes and manage their lifetimes. This includes
@@ -264,7 +271,7 @@ impl PostOffice {
         route.group = Some(group);
 
         RouteAddress {
-            handle: route.key(),
+            handle: RouteHandle(route.key()),
             generation: route.generation,
         }
     }
@@ -303,7 +310,7 @@ impl PostOffice {
         });
 
         // mark this route for clearing
-        self.routes.clear(address.handle);
+        self.routes.clear(address.handle.0);
     }
 
     /// Sends a signal to a route by address.
@@ -388,7 +395,7 @@ impl PostOffice {
 
     /// Internal helper function to look up a route by address (including generation).
     fn get_route(&self, address: &RouteAddress) -> Option<impl Deref<Target = Route> + '_> {
-        let route = self.routes.get(address.handle)?;
+        let route = self.routes.get(address.handle.0)?;
 
         if route.generation != address.generation {
             None
@@ -402,7 +409,7 @@ impl PostOffice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RouteAddress {
     /// The index of this route in the post office's route pool.
-    pub(crate) handle: usize,
+    pub(crate) handle: RouteHandle,
 
     /// The generation of this address's handle.
     pub(crate) generation: u32,

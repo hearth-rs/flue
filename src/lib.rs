@@ -27,6 +27,9 @@
 //! access to routes using fine-grained permission flags. **Tables** are stores
 //! of integer-addressed, unforgeable capabilities.
 //!
+//! Please note that signals may **only** be sent to routes and that mailboxes
+//! may **only** received signals through the routes that they are bound to.
+//!
 //! Flue is made for the purpose of efficiently executing potentially untrusted
 //! process code, so to support running that code, Flue's security model has
 //! the following axioms:
@@ -42,7 +45,7 @@
 //! capability to the other's mailbox to help explain the mental model of a
 //! full Flue-based actor system:
 //!
-//! ```
+//! ```text
 //!         Process A               Post Office               Process B
 //! ┌───────────────────────┐     ┌─────────────┐     ┌───────────────────────┐
 //! │         Table         │     │             │     │         Table         │
@@ -121,9 +124,9 @@ bitflags::bitflags! {
     }
 }
 
-/// A non-owning, internal signal using post office addresses.
+/// A non-owning signal using route addresses scoped within the post office.
 #[derive(Clone, Copy, Debug)]
-enum Signal<'a> {
+enum RouteSignal<'a> {
     Unlink {
         address: RouteAddress,
     },
@@ -133,13 +136,13 @@ enum Signal<'a> {
     },
 }
 
-impl<'a> NonOwningMessage<'a> for Signal<'a> {
-    type Owning = OwnedSignal;
+impl<'a> NonOwningMessage<'a> for RouteSignal<'a> {
+    type Owning = OwnedRouteSignal;
 
-    fn to_owned(self) -> OwnedSignal {
+    fn to_owned(self) -> OwnedRouteSignal {
         match self {
-            Signal::Unlink { address } => OwnedSignal::Unlink { address },
-            Signal::Message { data, caps } => OwnedSignal::Message {
+            RouteSignal::Unlink { address } => OwnedRouteSignal::Unlink { address },
+            RouteSignal::Message { data, caps } => OwnedRouteSignal::Message {
                 data: data.to_vec(),
                 caps: caps.to_vec(),
             },
@@ -147,10 +150,10 @@ impl<'a> NonOwningMessage<'a> for Signal<'a> {
     }
 }
 
-/// An owning, internal signal using post office addresses.
+/// An owning signal using route addresses scoped within the post office.
 ///
-/// Owning version of [Signal].
-enum OwnedSignal {
+/// Owning version of [RouteSignal].
+enum OwnedRouteSignal {
     Unlink {
         address: RouteAddress,
     },
@@ -160,13 +163,13 @@ enum OwnedSignal {
     },
 }
 
-impl OwningMessage for OwnedSignal {
-    type NonOwning<'a> = Signal<'a>;
+impl OwningMessage for OwnedRouteSignal {
+    type NonOwning<'a> = RouteSignal<'a>;
 
     fn to_non_owned(&self) -> Self::NonOwning<'_> {
         match self {
-            OwnedSignal::Unlink { address } => Signal::Unlink { address: *address },
-            OwnedSignal::Message { data, caps } => Signal::Message {
+            OwnedRouteSignal::Unlink { address } => RouteSignal::Unlink { address: *address },
+            OwnedRouteSignal::Message { data, caps } => RouteSignal::Message {
                 data: data.as_slice(),
                 caps: caps.as_slice(),
             },
@@ -199,7 +202,7 @@ impl RouteGroup {
 /// A clearable connection to a [Mailbox]. Addressed in [PostOffice] by [RouteAddress].
 struct Route {
     /// A sender to this route's associated [Mailbox].
-    tx: Option<Sender<OwnedSignal>>,
+    tx: Option<Sender<OwnedRouteSignal>>,
 
     /// The [RouteGroup] that this route is a member of.
     group: Option<Arc<Mutex<RouteGroup>>>,
@@ -209,8 +212,27 @@ struct Route {
     /// This is taken when this route is closed.
     linked_routes: Mutex<Option<HashSet<RouteAddress>>>,
 
-    /// The generation of this route. Routes that are allocated in the [PostOffice]
-    /// with the same address are differentiated by generation.
+    /// The generation of this route.
+    ///
+    /// Because [Pool] can allocate a new route with a reused [RouteHandle]
+    /// to an old route that has been closed, using [RouteHandle] alone to
+    /// access routes could potentially lead to outstanding handles to the old
+    /// route instead sending signals to new routes. Instead of a complicated,
+    /// inefficient garbage collection or reference counting system that can
+    /// ensure that routes are never freed until all of their references are
+    /// gone, we simply store a persistent generation counter that is
+    /// incremented whenever the route at its handle is closed. Then, the
+    /// generation is used together with [RouteHandle] in [RouteAddress] to
+    /// access routes.
+    ///
+    /// Note that the [sharded_slab] crate we're using also has a
+    /// [sharded_slab::Slab] type that includes the generation in its handle,
+    /// however, that generation has only a handful of bits available because
+    /// other data needs to be included in the bits of a `usize`. Very old
+    /// route handles could potentially refer to new routes if that generation
+    /// overflows. Instead, we manually use the [Pool] type so that we can use
+    /// a full `u32` to represent the generation that will never overflow in
+    /// practice.
     generation: u32,
 }
 
@@ -266,7 +288,7 @@ impl PostOffice {
     /// Inserts a new route into this post office and returns its new [RouteAddress].
     pub(crate) fn insert(
         &self,
-        tx: Sender<OwnedSignal>,
+        tx: Sender<OwnedRouteSignal>,
         group: Arc<Mutex<RouteGroup>>,
     ) -> RouteAddress {
         let mut route = self.routes.create().unwrap();
@@ -308,7 +330,7 @@ impl PostOffice {
         // mitigates timing attacks and eliminates delays in large networks of links
         tokio::spawn(async move {
             for link in linked_routes {
-                post.send(&link, Signal::Unlink { address }).await;
+                post.send(&link, RouteSignal::Unlink { address }).await;
             }
         });
 
@@ -321,7 +343,7 @@ impl PostOffice {
     /// This function is async because zero-copy signal sending needs to wait
     /// for the receiver to finish receiving before the signal's memory can be
     /// safely destroyed.
-    pub(crate) async fn send(self: &Arc<Self>, address: &RouteAddress, signal: Signal<'_>) {
+    pub(crate) async fn send(self: &Arc<Self>, address: &RouteAddress, signal: RouteSignal<'_>) {
         // nest in block to make this function's future impl Send
         let result = {
             let Some(route) = self.get_route(address) else {
@@ -361,7 +383,7 @@ impl PostOffice {
             let object = *object;
             let post = self.to_owned();
             tokio::spawn(async move {
-                post.send(&object, Signal::Unlink { address: subject })
+                post.send(&object, RouteSignal::Unlink { address: subject })
                     .await;
                 post.close(&subject);
             })
@@ -419,8 +441,8 @@ pub(crate) struct RouteAddress {
 
 /// A capability to a route in a [PostOffice].
 ///
-/// This includes both the [RouteAddress] of the route and the [Permissions] of the
-/// operations that can be performed on that route with this capability.
+/// This includes both the [RouteAddress] of the route and the [Permissions] of
+/// the operations that can be performed on that route with this capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Capability {
     pub address: RouteAddress,
@@ -584,15 +606,15 @@ impl Table {
     }
 
     /// Imports a table-less [Signal] to a table-local [ContextSignal].
-    pub(crate) fn map_signal<'a>(&self, signal: Signal<'a>) -> ContextSignal<'a> {
+    pub(crate) fn map_signal<'a>(&self, signal: RouteSignal<'a>) -> TableSignal<'a> {
         match signal {
-            Signal::Unlink { address } => ContextSignal::Unlink {
+            RouteSignal::Unlink { address } => TableSignal::Unlink {
                 handle: self.insert(Capability {
                     address,
                     perms: Permissions::empty(),
                 }),
             },
-            Signal::Message { data, caps } => ContextSignal::Message {
+            RouteSignal::Message { data, caps } => TableSignal::Message {
                 data,
                 caps: caps.iter().map(|cap| self.insert(*cap)).collect(),
             },
@@ -600,12 +622,12 @@ impl Table {
     }
 
     /// Imports a table-less [Signal] to a table-local [OwnedContextSignal].
-    pub(crate) fn map_signal_owned(&self, signal: Signal<'_>) -> OwnedContextSignal<'_> {
+    pub(crate) fn map_signal_owned(&self, signal: RouteSignal<'_>) -> OwnedTableSignal<'_> {
         match self.map_signal(signal) {
-            ContextSignal::Unlink { handle } => OwnedContextSignal::Unlink {
+            TableSignal::Unlink { handle } => OwnedTableSignal::Unlink {
                 handle: self.wrap_handle(handle).unwrap(),
             },
-            ContextSignal::Message { data, caps } => OwnedContextSignal::Message {
+            TableSignal::Message { data, caps } => OwnedTableSignal::Message {
                 data: data.to_owned(),
                 caps: caps
                     .into_iter()
@@ -722,7 +744,7 @@ impl Table {
     /// Links a capability handle to a given mailbox.
     ///
     /// When the capability's route is closed, the mailbox will receive an
-    /// unlink signal ([ContextSignal::Unlink] or [OwnedContextSignal::Unlink])
+    /// unlink signal ([TableSignal::Unlink] or [OwnedTableSignal::Unlink])
     /// with a capability handle of a demoted version of the linked capability
     /// *but with no [Permissions]*.
     ///
@@ -787,7 +809,7 @@ impl Table {
         self.post
             .send(
                 &address,
-                Signal::Message {
+                RouteSignal::Message {
                     data,
                     caps: &mapped_caps,
                 },
@@ -892,7 +914,7 @@ impl<'a> CapabilityRef<'a> {
     /// Links this capability handle to a given mailbox.
     ///
     /// When this capability's route is closed, the mailbox will receive an
-    /// unlink signal ([ContextSignal::Unlink] or [OwnedContextSignal::Unlink])
+    /// unlink signal ([TableSignal::Unlink] or [OwnedTableSignal::Unlink])
     /// with a capability handle of a demoted version of this capability *but
     /// with no [Permissions]*.
     ///
@@ -928,20 +950,21 @@ impl<'a> CapabilityRef<'a> {
     }
 }
 
-/// A signal received through [Mailbox::recv] or [Mailbox::try_recv].
+/// A signal that has been received through [Mailbox::recv] or
+/// [Mailbox::try_recv] and has been imported into a [Table].
 ///
 /// This enum is non-owning and facilitates zero-copy signal-sending. For
 /// low-level scripting integrations or performance-sensitive signal handling,
 /// this is fine. If you're not doing any of that, you probably want to use
-/// [Mailbox::recv_owned] and [Mailbox::try_recv_owned] with
-/// [OwnedContextSignal] instead.
+/// [Mailbox::recv_owned] and [Mailbox::try_recv_owned] to get an
+/// [OwnedTableSignal] instead.
 ///
 /// Senders of non-owning signals wait for signals to be handled since they own
 /// the signals' memory. Finish dealing with this signal in as quick and as
 /// constant of a time as possible to avoid creating timing attack
 /// vulnerabilities.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ContextSignal<'a> {
+pub enum TableSignal<'a> {
     /// A notification that a capability linked to this mailbox has been killed.
     Unlink {
         /// An owning handle of a demoted version of the capability that was
@@ -959,13 +982,14 @@ pub enum ContextSignal<'a> {
     },
 }
 
-/// An owned signal received through [Mailbox::recv_owned] or [Mailbox::try_recv_owned].
+/// An owned signal that has been received through [Mailbox::recv_owned] or
+/// [Mailbox::try_recv_owned] and has been imported into a [Table].
 ///
-/// A slower, owning version of [ContextSignal]. The generic lifetime parameter
-/// of this object is tied to the lifetime of the current table and not to the
-/// receiving of the message.
+/// A higher-level, owning version of [TableSignal]. The generic lifetime
+/// parameter of this object is tied to the lifetime of the current table and
+/// not to the receiving of the message.
 #[derive(Clone, Debug)]
-pub enum OwnedContextSignal<'a> {
+pub enum OwnedTableSignal<'a> {
     /// A notification that a capability linked to this mailbox has been killed.
     Unlink {
         /// An owning handle of a demoted version of the capability that was
@@ -1037,7 +1061,7 @@ impl<'a> MailboxGroup<'a> {
     }
 }
 
-/// A receiver for [ContextSignals][ContextSignal].
+/// A receiver for [TableSignals][TableSignal].
 ///
 /// Processes create mailboxes in order to receive signals from other processes.
 /// A process can close a mailbox, unlinking it from the other processes, or
@@ -1052,7 +1076,7 @@ impl<'a> MailboxGroup<'a> {
 pub struct Mailbox<'a> {
     group: &'a MailboxGroup<'a>,
     address: RouteAddress,
-    rx: Receiver<OwnedSignal>,
+    rx: Receiver<OwnedRouteSignal>,
 }
 
 impl<'a> Drop for Mailbox<'a> {
@@ -1064,11 +1088,11 @@ impl<'a> Drop for Mailbox<'a> {
 impl<'a> Mailbox<'a> {
     /// Receives a single signal from this mailbox.
     ///
-    /// [ContextSignal] is non-owning, so this function takes a closure to map
-    /// a temporary [ContextSignal] into types of a larger lifetime.
+    /// [TableSignal] is non-owning, so this function takes a closure to map a
+    /// temporary [TableSignal] into types of a larger lifetime.
     ///
     /// Returns `None` when this mailbox's process has been killed.
-    pub async fn recv<T>(&self, mut f: impl FnMut(ContextSignal) -> T) -> Option<T> {
+    pub async fn recv<T>(&self, mut f: impl FnMut(TableSignal) -> T) -> Option<T> {
         self.rx
             .recv(|signal| {
                 let signal = self.group.table.map_signal(signal);
@@ -1078,10 +1102,10 @@ impl<'a> Mailbox<'a> {
             .ok()
     }
 
-    /// Receives a [OwnedContextSignal].
+    /// Receives a [OwnedTableSignal].
     ///
     /// Returns `None` when this mailbox's process has been killed.
-    pub async fn recv_owned(&self) -> Option<OwnedContextSignal<'a>> {
+    pub async fn recv_owned(&self) -> Option<OwnedTableSignal<'a>> {
         self.rx
             .recv(|signal| self.group.table.map_signal_owned(signal))
             .await
@@ -1090,14 +1114,14 @@ impl<'a> Mailbox<'a> {
 
     /// Polls this mailbox for any currently available signals.
     ///
-    /// [ContextSignal] is non-owning, so this function takes a lambda to map
-    /// a temporary [ContextSignal] into types of a larger lifetime.
+    /// [TableSignal] is non-owning, so this function takes a lambda to map
+    /// a temporary [TableSignal] into types of a larger lifetime.
     ///
     /// Returns:
     /// - `Some(Some(t))` when there was a signal available and it was mapped by the lambda.
     /// - `Some(None)` when there was not a signal available.
     /// - `None` when this mailbox's process has been killed.
-    pub fn try_recv<T>(&self, mut f: impl FnMut(ContextSignal) -> T) -> Option<Option<T>> {
+    pub fn try_recv<T>(&self, mut f: impl FnMut(TableSignal) -> T) -> Option<Option<T>> {
         let result = self.rx.try_recv(|signal| {
             let signal = self.group.table.map_signal(signal);
             f(signal)
@@ -1116,7 +1140,7 @@ impl<'a> Mailbox<'a> {
     /// - `Some(Some(t))` when there was a signal available.
     /// - `Some(None)` when there was not a signal available.
     /// - `None` when this mailbox's process has been killed.
-    pub fn try_recv_owned(&self) -> Option<Option<OwnedContextSignal<'a>>> {
+    pub fn try_recv_owned(&self) -> Option<Option<OwnedTableSignal<'a>>> {
         let result = self
             .rx
             .try_recv(|signal| self.group.table.map_signal_owned(signal));

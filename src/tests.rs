@@ -10,7 +10,7 @@ async fn send_message() {
 
     assert!(mb
         .recv(|s| {
-            s == ContextSignal::Message {
+            s == TableSignal::Message {
                 data: b"Hello world!",
                 caps: vec![],
             }
@@ -29,7 +29,7 @@ async fn send_address() {
 
     assert!(mb
         .recv(move |s| {
-            s == ContextSignal::Message {
+            s == TableSignal::Message {
                 data: b"",
                 caps: vec![ad.handle],
             }
@@ -50,7 +50,7 @@ async fn table_send_impls_send() {
 
         assert!(mb
             .recv(|s| {
-                s == ContextSignal::Message {
+                s == TableSignal::Message {
                     data: b"Hello world!",
                     caps: vec![],
                 }
@@ -75,7 +75,7 @@ async fn try_recv() {
 
     assert!(mb
         .try_recv(|s| {
-            s == ContextSignal::Message {
+            s == TableSignal::Message {
                 data: b"Hello world!",
                 caps: vec![],
             }
@@ -188,7 +188,7 @@ async fn unlink_on_kill() {
     s_cap.link(&object).unwrap();
     s_cap.kill().unwrap();
 
-    let expected = ContextSignal::Unlink {
+    let expected = TableSignal::Unlink {
         handle: s_cap.demote(Permissions::empty()).unwrap().handle,
     };
 
@@ -205,7 +205,7 @@ async fn unlink_on_close() {
     s_cap.link(&object).unwrap();
     drop(s_mb);
 
-    let expected = ContextSignal::Unlink {
+    let expected = TableSignal::Unlink {
         handle: s_cap.demote(Permissions::empty()).unwrap().handle,
     };
 
@@ -232,7 +232,7 @@ async fn unlink_dead() {
     s_cap.kill().unwrap();
     s_cap.link(&object).unwrap();
 
-    let expected = ContextSignal::Unlink {
+    let expected = TableSignal::Unlink {
         handle: s_cap.demote(Permissions::empty()).unwrap().handle,
     };
 
@@ -249,7 +249,7 @@ async fn unlink_closed() {
     drop(s_mb);
     s_cap.link(&object).unwrap();
 
-    let expected = ContextSignal::Unlink {
+    let expected = TableSignal::Unlink {
         handle: s_cap.demote(Permissions::empty()).unwrap().handle,
     };
 

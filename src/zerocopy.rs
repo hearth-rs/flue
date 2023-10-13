@@ -69,7 +69,7 @@ where
         Ok(fut)
     }
 
-    /// The number of receivers in this channel.
+    /// Get the number of receivers in this channel.
     pub fn receiver_count(&self) -> usize {
         self.inner_tx.receiver_count()
     }
@@ -131,7 +131,7 @@ where
         Ok(result)
     }
 
-    /// The number of senders in this channel.
+    /// Get the number of senders in this channel.
     pub fn sender_count(&self) -> usize {
         self.inner_rx.sender_count()
     }

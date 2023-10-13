@@ -478,7 +478,7 @@ struct TableInner {
 impl TableInner {
     /// Inserts a [Capability] into this table. Reuses existing capability
     /// handles and increments their reference count if available.
-    pub fn insert(&mut self, cap: Capability) -> CapabilityHandle {
+    pub fn import(&mut self, cap: Capability) -> CapabilityHandle {
         use std::collections::hash_map::Entry;
         let entry = self.reverse_entries.entry(cap);
         match entry {
@@ -568,13 +568,13 @@ impl Table {
     }
 
     /// Directly inserts an [OwnedCapability] into this table.
-    pub fn insert_owned(&self, cap: OwnedCapability) -> Result<CapabilityHandle, TableError> {
+    pub fn import_owned(&self, cap: OwnedCapability) -> Result<CapabilityHandle, TableError> {
         assert_eq!(Arc::as_ptr(&self.post), Arc::as_ptr(&cap.post));
         Ok(CapabilityHandle(self.insert(cap.inner).0))
     }
 
     pub(crate) fn insert(&self, cap: Capability) -> CapabilityHandle {
-        self.inner.lock().insert(cap)
+        self.inner.lock().import(cap)
     }
 
     /// Imports a table-less [Signal] to a table-local [ContextSignal].
@@ -709,7 +709,7 @@ impl Table {
             return Err(TableError::PermissionDenied);
         }
 
-        let handle = inner.insert(Capability { address, perms });
+        let handle = inner.import(Capability { address, perms });
         Ok(handle)
     }
 

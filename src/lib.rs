@@ -242,7 +242,7 @@ struct RouteHandle(usize);
 /// Shared signal transport for all of the processes in a shared context.
 ///
 /// Post offices store pools of routes and manage their lifetimes. This includes
-/// sending messages, closing, killing, and linking them between each other.
+/// sending signals, closing, killing, and linking them between each other.
 ///
 /// Processes reference routes by their addresses, which along with
 /// [Permissions] compose a capability.

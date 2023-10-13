@@ -29,7 +29,7 @@
 //! of integer-addressed, unforgeable capabilities.
 //!
 //! Please note that signals may **only** be sent to routes and that mailboxes
-//! may **only** receive signals through the routes that they are bound to.
+//! may **only** received signals through the routes that they are bound to.
 //!
 //! Flue is made for the purpose of efficiently executing potentially untrusted
 //! process code, so to support running that code, Flue's security model has
@@ -47,24 +47,24 @@
 //! full Flue-based actor system:
 //!
 //! ```text
-//!         Process A              Post Office               Process B
-//! ┌───────────────────────┐    ┌─────────────┐     ┌───────────────────────┐
-//! │         Table         │    │             │     │         Table         │
-//! │ ┌───────────────────┐ │    │ ┌─────────┐ │     │ ┌───────────────────┐ │
-//! │ │                   │ │    │ │         │ │     │ │                   │ │
-//! │ │ ┌───────────────┐ │ │ ┌──┼─► Route B ├─┼───┐ │ │ ┌───────────────┐ │ │
-//! │ │ │ Capability A  ├─┼─┼─┘  │ │         │ │   │ │ │ │ Capability B  ├─┼─┼─┐
-//! │ │ └───────────────┘ │ │    │ └─────────┘ │   │ │ │ └───────────────┘ │ │ │
-//! │ │                   │ │    │             │   │ │ │                   │ │ │
-//! │ └────────▲──────────┘ │    │ ┌─────────┐ │   │ │ └────────▲──────────┘ │ │
-//! │          │            │    │ │         │ │   │ │          │            │ │
-//! │   ┌──────┴───────┐    │ ┌──┼─┤ Route A ◄─┼─┐ │ │   ┌──────┴───────┐    │ │
-//! │   │   Mailbox A  ◄────┼─┘  │ │         │ │ │ └─┼───►   Mailbox B  │    │ │
-//! │   └──────────────┘    │    │ └─────────┘ │ │   │   └──────────────┘    │ │
-//! │                       │    │             │ │   │                       │ │
-//! └───────────────────────┘    └─────────────┘ │   └───────────────────────┘ │
-//!                                              │                             │
-//!                                              └─────────────────────────────┘
+//!         Process A               Post Office               Process B
+//! ┌───────────────────────┐     ┌─────────────┐     ┌───────────────────────┐
+//! │         Table         │     │             │     │         Table         │
+//! │ ┌───────────────────┐ │     │ ┌─────────┐ │     │ ┌───────────────────┐ │
+//! │ │                   │ │     │ │         │ │     │ │                   │ │
+//! │ │ ┌───────────────┐ │ │  ┌──┼─► Route B ├─┼───┐ │ │ ┌───────────────┐ │ │
+//! │ │ │ Capability A  ├─┼─┼──┘  │ │         │ │   │ │ │ │ Capability B  ├─┼─┼─┐
+//! │ │ └───────────────┘ │ │     │ └─────────┘ │   │ │ │ └───────────────┘ │ │ │
+//! │ │                   │ │     │             │   │ │ │                   │ │ │
+//! │ └────────▲──────────┘ │     │ ┌─────────┐ │   │ │ └────────▲──────────┘ │ │
+//! │          │            │     │ │         │ │   │ │          │            │ │
+//! │   ┌──────┴───────┐    │  ┌──┼─┤ Route A ◄─┼─┐ │ │   ┌──────┴───────┐    │ │
+//! │   │   Mailbox A  ◄────┼──┘  │ │         │ │ │ └─┼───►   Mailbox B  │    │ │
+//! │   └──────────────┘    │     │ └─────────┘ │ │   │   └──────────────┘    │ │
+//! │                       │     │             │ │   │                       │ │
+//! └───────────────────────┘     └─────────────┘ │   └───────────────────────┘ │
+//!                                               │                             │
+//!                                               └─────────────────────────────┘
 //! ```
 //!
 //! Both processes share a post office, and mailboxes A and B have associated
@@ -625,7 +625,7 @@ impl Table {
     pub(crate) fn map_signal<'a>(&self, signal: RouteSignal<'a>) -> TableSignal<'a> {
         match signal {
             RouteSignal::Unlink { address } => TableSignal::Unlink {
-                handle: self.import(Capability {
+                handle: self.insert(Capability {
                     address,
                     perms: Permissions::empty(),
                 }),

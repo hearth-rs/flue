@@ -28,7 +28,7 @@
 //! of integer-addressed, unforgeable capabilities.
 //!
 //! Please note that signals may **only** be sent to routes and that mailboxes
-//! may **only** received signals through the routes that they are bound to.
+//! may **only** receive signals through the routes that they are bound to.
 //!
 //! Flue is made for the purpose of efficiently executing potentially untrusted
 //! process code, so to support running that code, Flue's security model has
@@ -455,7 +455,7 @@ pub(crate) struct Capability {
 /// table to another without needing to send and receive messages.
 ///
 /// You can get and insert owned capabilities using [Table::get_owned] and
-/// [Table::insert_owned]. Please keep in mind that owned capabilities have
+/// [Table::import_owned]. Please keep in mind that owned capabilities have
 /// an `Arc<PostOffice>` inside and are thus relatively expensive to clone and
 /// destroy. Minimize their usage in performance-critical code.
 #[derive(Clone)]

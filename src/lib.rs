@@ -29,7 +29,7 @@
 //! of integer-addressed, unforgeable capabilities.
 //!
 //! Please note that signals may **only** be sent to routes and that mailboxes
-//! may **only** received signals through the routes that they are bound to.
+//! may **only** receive signals through the routes that they are bound to.
 //!
 //! Flue is made for the purpose of efficiently executing potentially untrusted
 //! process code, so to support running that code, Flue's security model has

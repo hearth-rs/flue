@@ -1,4 +1,5 @@
 use super::*;
+
 #[tokio::test]
 async fn send_message() {
     let table = Table::default();

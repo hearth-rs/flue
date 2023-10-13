@@ -96,8 +96,10 @@ use sharded_slab::{Clear, Pool};
 use slab::Slab;
 use zerocopy::{channel, NonOwningMessage, OwningMessage, Receiver, Sender};
 
-pub mod zerocopy;
+#[cfg(test)]
 mod tests;
+
+pub mod zerocopy;
 
 bitflags::bitflags! {
     /// Permission flags for a capability.
@@ -498,18 +500,21 @@ impl TableInner {
     }
 }
 
-/// A handle to a Capability.
+/// An integer handle to a capability within a [Table].
 ///
-/// Capabilities are stored in the [TableInner]'s slab. They are indexed by a
-/// `usize`. Outisde of the slab the `usize` is referred to by this type alias.
+/// This is a low-level type for directing managing capability handles. You
+/// should manually call [Table::inc_ref] and [Table::dec_ref] for the lifetime
+/// of this type. If you're looking for a friendlier capability API, check out
+/// [CapabilityRef].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CapabilityHandle(usize);
+pub struct CapabilityHandle(pub usize);
 
 /// Contains unforgeable capabilities, performs operations on them, and moderates
 /// access to them.
 ///
-/// Each capability in a [Table] is referenced by an opaque integer handle.
-/// Handles are reference-counted, and are freed when their refcount hits zero.
+/// Each capability in a [Table] is referenced by an opaque integer handle,
+/// stored in the [CapabilityHandle] type. Handles are reference-counted, and
+/// are freed when their refcount hits zero.
 ///
 /// This struct has low-level operations on capability handles, but unless
 /// you're doing low-level integration of a table into a scripting environment,
@@ -573,6 +578,7 @@ impl Table {
         Ok(CapabilityHandle(self.insert(cap.inner).0))
     }
 
+    /// Helper function to directly insert a [Capability] into this table.
     pub(crate) fn insert(&self, cap: Capability) -> CapabilityHandle {
         self.inner.lock().import(cap)
     }
@@ -1135,4 +1141,3 @@ impl<'a> Mailbox<'a> {
         }
     }
 }
-

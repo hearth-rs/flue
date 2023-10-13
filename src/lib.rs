@@ -205,7 +205,7 @@ struct Route {
     /// A set of other routes that are linked to this route.
     ///
     /// This is taken when this route is closed.
-    links: Mutex<Option<HashSet<RouteAddress>>>,
+    linked_routes: Mutex<Option<HashSet<RouteAddress>>>,
 
     /// The generation of this route. Routes that are allocated in the [PostOffice]
     /// with the same address are differentiated by generation.
@@ -217,7 +217,7 @@ impl Default for Route {
         Self {
             tx: None,
             group: None,
-            links: Mutex::new(Some(HashSet::new())),
+            linked_routes: Mutex::new(Some(HashSet::new())),
             generation: 0,
         }
     }
@@ -227,7 +227,7 @@ impl Clear for Route {
     fn clear(&mut self) {
         self.tx.take();
         self.group.take();
-        self.links.lock().take();
+        self.linked_routes.lock().take();
         self.generation += 1;
     }
 }
@@ -295,7 +295,7 @@ impl PostOffice {
             return;
         };
 
-        let Some(links) = route.links.lock().take() else {
+        let Some(linked_routes) = route.linked_routes.lock().take() else {
             return;
         };
 
@@ -305,7 +305,7 @@ impl PostOffice {
         // unlink asynchronously in order to return in constant time
         // mitigates timing attacks and eliminates delays in large networks of links
         tokio::spawn(async move {
-            for link in links {
+            for link in linked_routes {
                 post.send(&link, Signal::Unlink { address }).await;
             }
         });
@@ -371,8 +371,8 @@ impl PostOffice {
             return;
         };
 
-        let mut links_lock = route.links.lock();
-        let Some(links) = links_lock.as_mut() else {
+        let mut links_lock = route.linked_routes.lock();
+        let Some(linked_routes) = links_lock.as_mut() else {
             // if links is taken, the route must be closed
             unlink();
             return;
@@ -390,8 +390,7 @@ impl PostOffice {
             return;
         }
 
-        // insert the link object
-        links.insert(*object);
+        linked_routes.insert(*object);
     }
 
     /// Internal helper function to look up a route by address (including generation).

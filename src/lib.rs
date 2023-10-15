@@ -472,6 +472,13 @@ pub enum TableError {
 
     /// A handle used in this table operation does not have sufficient permissions.
     PermissionDenied,
+
+    /// A handle used in this table operation belongs to a different post office 
+    /// than the one referenced by this table.
+    PostOfficeMismatch,
+
+    /// Something in this operation belongs to a different table than expected
+    TableMismatch,
 }
 
 impl Display for TableError {
@@ -479,6 +486,8 @@ impl Display for TableError {
         match self {
             TableError::InvalidHandle => write!(fmt, "invalid handle"),
             TableError::PermissionDenied => write!(fmt, "permission denied"),
+            TableError::PostOfficeMismatch => write!(fmt, "post office mismatch"),
+            TableError::TableMismatch => write!(fmt, "table mistmatch"),
         }
     }
 }
@@ -595,8 +604,12 @@ impl Table {
     }
 
     /// Directly inserts an [OwnedCapability] into this table.
+    ///
+    /// Returns [TableError::PostOfficeMismatch] if the capability has a different [PostOffice].
     pub fn import_owned(&self, cap: OwnedCapability) -> Result<CapabilityHandle, TableError> {
-        assert_eq!(Arc::as_ptr(&self.post), Arc::as_ptr(&cap.post));
+        if Arc::as_ptr(&self.post) != Arc::as_ptr(&cap.post) {
+            return Err(TableError::PostOfficeMismatch);
+        }
         Ok(CapabilityHandle(self.insert(cap.inner).0))
     }
 
@@ -656,17 +669,16 @@ impl Table {
 
     /// Imports a capability to *any* [Mailbox] into this table.
     ///
-    /// Panics if the mailbox has a different [PostOffice].
-    pub fn import(&self, mailbox: &Mailbox, perms: Permissions) -> CapabilityHandle {
-        assert_eq!(
-            Arc::as_ptr(&self.post),
-            Arc::as_ptr(&mailbox.group.table.post)
-        );
+    /// Returns [TableError::PostOfficeMismatch] if the mailbox has a different [PostOffice].
+    pub fn import(&self, mailbox: &Mailbox, perms: Permissions) -> Result<CapabilityHandle, TableError> {
+        if Arc::as_ptr(&self.post) != Arc::as_ptr(&mailbox.group.table.post) {
+            return Err(TableError::PostOfficeMismatch);
+        }
 
-        self.insert(Capability {
+        Ok(self.insert(Capability {
             address: mailbox.address,
             perms,
-        })
+        }))
     }
 
     /// Increments the reference count of a capability handle.
@@ -751,9 +763,11 @@ impl Table {
     /// Returns [TableError::PermissionDenied] if the capability does not have
     /// [Permissions::LINK].
     ///
-    /// Panics if the mailbox's table is not this table.
+    /// Returns [TableError::TableMismatch] if the mailbox belongs to a differe [Table].
     pub fn link(&self, handle: CapabilityHandle, mailbox: &Mailbox) -> Result<(), TableError> {
-        assert!(std::ptr::eq(mailbox.group.table, self));
+        if !std::ptr::eq(mailbox.group.table, self) {
+            return Err(TableError::TableMismatch)
+        }
         let inner = self.inner.lock();
         let entry = inner
             .entries
@@ -931,10 +945,14 @@ impl<'a> CapabilityRef<'a> {
     /// This function is async because zero-copy sending of signals needs to
     /// wait for the receiver to finish consuming the sent data before returning
     /// in order to safely capture the lifetime of the data.
+    ///
+    /// Returns [TableError::TableMismatch] if any capabilities have a different [Table].
     pub async fn send(&self, data: &[u8], caps: &[&CapabilityRef<'_>]) -> Result<(), TableError> {
         let mut mapped_caps = Vec::with_capacity(caps.len());
         for cap in caps.iter() {
-            assert!(std::ptr::eq(cap.table, self.table));
+            if !std::ptr::eq(cap.table, self.table) {
+                return Err(TableError::TableMismatch)
+            }
             mapped_caps.push(cap.handle);
         }
 

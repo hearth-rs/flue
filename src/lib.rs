@@ -612,11 +612,11 @@ impl Table {
         if Arc::as_ptr(&self.post) != Arc::as_ptr(&cap.post) {
             return Err(TableError::PostOfficeMismatch);
         }
-        Ok(CapabilityHandle(self.insert(cap.inner).0))
+        Ok(CapabilityHandle(self.import(cap.inner).0))
     }
 
     /// Helper function to directly insert a [Capability] into this table.
-    pub(crate) fn insert(&self, cap: Capability) -> CapabilityHandle {
+    pub(crate) fn import(&self, cap: Capability) -> CapabilityHandle {
         self.inner.lock().import(cap)
     }
 
@@ -624,14 +624,14 @@ impl Table {
     pub(crate) fn map_signal<'a>(&self, signal: RouteSignal<'a>) -> TableSignal<'a> {
         match signal {
             RouteSignal::Unlink { address } => TableSignal::Unlink {
-                handle: self.insert(Capability {
+                handle: self.import(Capability {
                     address,
                     perms: Permissions::empty(),
                 }),
             },
             RouteSignal::Message { data, caps } => TableSignal::Message {
                 data,
-                caps: caps.iter().map(|cap| self.insert(*cap)).collect(),
+                caps: caps.iter().map(|cap| self.import(*cap)).collect(),
             },
         }
     }
@@ -667,20 +667,6 @@ impl Table {
             table: self,
             handle,
         })
-    }
-
-    /// Imports a capability to *any* [Mailbox] into this table.
-    ///
-    /// Returns [TableError::PostOfficeMismatch] if the mailbox has a different [PostOffice].
-    pub fn import(&self, mailbox: &Mailbox, perms: Permissions) -> TableResult<CapabilityHandle> {
-        if Arc::as_ptr(&self.post) != Arc::as_ptr(&mailbox.group.table.post) {
-            return Err(TableError::PostOfficeMismatch);
-        }
-
-        Ok(self.insert(Capability {
-            address: mailbox.address,
-            perms,
-        }))
     }
 
     /// Increments the reference count of a capability handle.
@@ -1174,7 +1160,7 @@ impl<'a> Mailbox<'a> {
 
     /// Creates a capability within this mailbox's parent table to this mailbox's route.
     pub fn make_capability(&self, perms: Permissions) -> CapabilityRef<'a> {
-        let handle = self.group.table.insert(Capability {
+        let handle = self.group.table.import(Capability {
             address: self.address,
             perms,
         });
@@ -1182,6 +1168,19 @@ impl<'a> Mailbox<'a> {
         CapabilityRef {
             table: self.group.table,
             handle,
+        }
+    }
+
+    /// Exports an [OwnedCapability] from this mailbox.
+    ///
+    /// This method is intended to be used to import a capability from a mailbox into a [Table].
+    pub fn export(&self, perms: Permissions) -> OwnedCapability {
+        OwnedCapability {
+            inner: Capability {
+                address: self.address,
+                perms,
+            },
+            post: self.group.table.post.clone(),
         }
     }
 }

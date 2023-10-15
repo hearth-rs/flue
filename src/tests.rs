@@ -178,7 +178,7 @@ async fn unlink_on_kill() {
     let s_group = MailboxGroup::new(&child);
     let s_mb = s_group.create_mailbox().unwrap();
 
-    let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
+    let s_handle = table.import_owned(s_mb.export(Permissions::LINK | Permissions::KILL)).unwrap();
 
     let s_cap = CapabilityRef {
         table: &table,
@@ -222,7 +222,7 @@ async fn unlink_dead() {
     let s_group = MailboxGroup::new(&child);
     let s_mb = s_group.create_mailbox().unwrap();
 
-    let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
+    let s_handle = table.import_owned(s_mb.export(Permissions::LINK | Permissions::KILL)).unwrap();
 
     let s_cap = CapabilityRef {
         table: &table,

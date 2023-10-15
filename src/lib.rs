@@ -473,13 +473,15 @@ pub enum TableError {
     /// A handle used in this table operation does not have sufficient permissions.
     PermissionDenied,
 
-    /// A handle used in this table operation belongs to a different post office 
+    /// A handle used in this table operation belongs to a different post office
     /// than the one referenced by this table.
     PostOfficeMismatch,
 
     /// Something in this operation belongs to a different table than expected
     TableMismatch,
 }
+
+type TableResult<T> = Result<T, TableError>;
 
 impl Display for TableError {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -589,7 +591,7 @@ impl Table {
     }
 
     /// Gets an [OwnedCapability] by handle.
-    pub fn get_owned(&self, handle: CapabilityHandle) -> Result<OwnedCapability, TableError> {
+    pub fn get_owned(&self, handle: CapabilityHandle) -> TableResult<OwnedCapability> {
         let inner = self
             .inner
             .lock()
@@ -606,7 +608,7 @@ impl Table {
     /// Directly inserts an [OwnedCapability] into this table.
     ///
     /// Returns [TableError::PostOfficeMismatch] if the capability has a different [PostOffice].
-    pub fn import_owned(&self, cap: OwnedCapability) -> Result<CapabilityHandle, TableError> {
+    pub fn import_owned(&self, cap: OwnedCapability) -> TableResult<CapabilityHandle> {
         if Arc::as_ptr(&self.post) != Arc::as_ptr(&cap.post) {
             return Err(TableError::PostOfficeMismatch);
         }
@@ -656,7 +658,7 @@ impl Table {
     }
 
     /// Wraps a raw capability handle in a Rust-friendly [CapabilityRef] struct.
-    pub fn wrap_handle(&self, handle: CapabilityHandle) -> Result<CapabilityRef, TableError> {
+    pub fn wrap_handle(&self, handle: CapabilityHandle) -> TableResult<CapabilityRef> {
         if !self.is_valid(handle) {
             return Err(TableError::InvalidHandle);
         }
@@ -670,7 +672,7 @@ impl Table {
     /// Imports a capability to *any* [Mailbox] into this table.
     ///
     /// Returns [TableError::PostOfficeMismatch] if the mailbox has a different [PostOffice].
-    pub fn import(&self, mailbox: &Mailbox, perms: Permissions) -> Result<CapabilityHandle, TableError> {
+    pub fn import(&self, mailbox: &Mailbox, perms: Permissions) -> TableResult<CapabilityHandle> {
         if Arc::as_ptr(&self.post) != Arc::as_ptr(&mailbox.group.table.post) {
             return Err(TableError::PostOfficeMismatch);
         }
@@ -685,7 +687,7 @@ impl Table {
     ///
     /// If you'd prefer not to do this manually, try using [Table::wrap_handle]
     /// and relying on [CapabilityRef]'s `Clone` implementation instead.
-    pub fn inc_ref(&self, handle: CapabilityHandle) -> Result<(), TableError> {
+    pub fn inc_ref(&self, handle: CapabilityHandle) -> TableResult<()> {
         self.inner
             .lock()
             .entries
@@ -701,7 +703,7 @@ impl Table {
     ///
     /// If you'd prefer not to do this manually, try using [Table::wrap_handle]
     /// and relying on [CapabilityRef]'s `Drop` implementation instead.
-    pub fn dec_ref(&self, handle: CapabilityHandle) -> Result<(), TableError> {
+    pub fn dec_ref(&self, handle: CapabilityHandle) -> TableResult<()> {
         let mut inner = self.inner.lock();
 
         let entry = inner
@@ -720,7 +722,7 @@ impl Table {
     }
 
     /// Retrieves the [Permissions] of a capability handle.
-    pub fn get_permissions(&self, handle: CapabilityHandle) -> Result<Permissions, TableError> {
+    pub fn get_permissions(&self, handle: CapabilityHandle) -> TableResult<Permissions> {
         self.inner
             .lock()
             .entries
@@ -737,7 +739,7 @@ impl Table {
         &self,
         handle: CapabilityHandle,
         perms: Permissions,
-    ) -> Result<CapabilityHandle, TableError> {
+    ) -> TableResult<CapabilityHandle> {
         let mut inner = self.inner.lock();
         let entry = inner
             .entries
@@ -764,9 +766,9 @@ impl Table {
     /// [Permissions::LINK].
     ///
     /// Returns [TableError::TableMismatch] if the mailbox belongs to a differe [Table].
-    pub fn link(&self, handle: CapabilityHandle, mailbox: &Mailbox) -> Result<(), TableError> {
+    pub fn link(&self, handle: CapabilityHandle, mailbox: &Mailbox) -> TableResult<()> {
         if !std::ptr::eq(mailbox.group.table, self) {
-            return Err(TableError::TableMismatch)
+            return Err(TableError::TableMismatch);
         }
         let inner = self.inner.lock();
         let entry = inner
@@ -798,7 +800,7 @@ impl Table {
         handle: CapabilityHandle,
         data: &[u8],
         caps: &[CapabilityHandle],
-    ) -> Result<(), TableError> {
+    ) -> TableResult<()> {
         // move into block to make this future Send
         let (address, mapped_caps) = {
             let inner = self.inner.lock();
@@ -840,7 +842,7 @@ impl Table {
     ///
     /// Returns [TableError::PermissionDenied] if the given capability does not
     /// have [Permissions::KILL].
-    pub fn kill(&self, handle: CapabilityHandle) -> Result<(), TableError> {
+    pub fn kill(&self, handle: CapabilityHandle) -> TableResult<()> {
         let inner = self.inner.lock();
         let entry = inner
             .entries
@@ -918,7 +920,7 @@ impl<'a> CapabilityRef<'a> {
     ///
     /// Returns [TableError::PermissionDenied] if the permissions requested are
     /// not in this one's.
-    pub fn demote(&self, perms: Permissions) -> Result<Self, TableError> {
+    pub fn demote(&self, perms: Permissions) -> TableResult<Self> {
         Ok(Self {
             table: self.table,
             handle: self.table.demote(self.handle, perms)?,
@@ -936,7 +938,7 @@ impl<'a> CapabilityRef<'a> {
     /// [Permissions::LINK].
     ///
     /// Panics if the mailbox's table is not this table.
-    pub fn link(&self, mailbox: &Mailbox<'a>) -> Result<(), TableError> {
+    pub fn link(&self, mailbox: &Mailbox<'a>) -> TableResult<()> {
         self.table.link(self.handle, mailbox)
     }
 
@@ -947,11 +949,11 @@ impl<'a> CapabilityRef<'a> {
     /// in order to safely capture the lifetime of the data.
     ///
     /// Returns [TableError::TableMismatch] if any capabilities have a different [Table].
-    pub async fn send(&self, data: &[u8], caps: &[&CapabilityRef<'_>]) -> Result<(), TableError> {
+    pub async fn send(&self, data: &[u8], caps: &[&CapabilityRef<'_>]) -> TableResult<()> {
         let mut mapped_caps = Vec::with_capacity(caps.len());
         for cap in caps.iter() {
             if !std::ptr::eq(cap.table, self.table) {
-                return Err(TableError::TableMismatch)
+                return Err(TableError::TableMismatch);
             }
             mapped_caps.push(cap.handle);
         }
@@ -963,7 +965,7 @@ impl<'a> CapabilityRef<'a> {
     ///
     /// Returns [TableError::PermissionDenied] if this capability does not have
     /// [Permissions::KILL].
-    pub fn kill(&self) -> Result<(), TableError> {
+    pub fn kill(&self) -> TableResult<()> {
         self.table.kill(self.handle)
     }
 }

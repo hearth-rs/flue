@@ -489,7 +489,7 @@ impl Display for TableError {
             TableError::InvalidHandle => write!(fmt, "invalid handle"),
             TableError::PermissionDenied => write!(fmt, "permission denied"),
             TableError::PostOfficeMismatch => write!(fmt, "post office mismatch"),
-            TableError::TableMismatch => write!(fmt, "table mistmatch"),
+            TableError::TableMismatch => write!(fmt, "table mismatch"),
         }
     }
 }
@@ -559,7 +559,7 @@ pub struct CapabilityHandle(pub usize);
 /// have the same integer value, then they are identical. Please note that
 /// the equivalence of capabilities is determined by both that capability's
 /// address (the route it actually points to) **AND** its [Permissions]. Two
-/// capabilities can point to the same route but be unequivalent because they
+/// capabilities can point to the same route but be nonequivalent because they
 /// have different permissions, so proceed with caution.
 pub struct Table {
     post: Arc<PostOffice>,
@@ -751,7 +751,7 @@ impl Table {
     /// Returns [TableError::PermissionDenied] if the capability does not have
     /// [Permissions::LINK].
     ///
-    /// Returns [TableError::TableMismatch] if the mailbox belongs to a differe [Table].
+    /// Returns [TableError::TableMismatch] if the mailbox belongs to a different [Table].
     pub fn link(&self, handle: CapabilityHandle, mailbox: &Mailbox) -> TableResult<()> {
         if !std::ptr::eq(mailbox.group.table, self) {
             return Err(TableError::TableMismatch);
@@ -1013,7 +1013,7 @@ pub enum OwnedTableSignal<'a> {
     },
 }
 
-/// A factory for [Mailbox]s that belong to the same route group.
+/// A factory for [Mailbox]es that belong to the same route group.
 ///
 /// Create a mailbox group for a table using [MailboxGroup::new], then create
 /// mailboxes using [MailboxGroup::create_mailbox]. When the mailboxes from

@@ -1159,7 +1159,7 @@ impl<'a> Mailbox<'a> {
     }
 
     /// Creates a capability within this mailbox's parent table to this mailbox's route.
-    pub fn make_capability(&self, perms: Permissions) -> CapabilityRef<'a> {
+    pub fn export(&self, perms: Permissions) -> CapabilityRef<'a> {
         let handle = self.group.table.import(Capability {
             address: self.address,
             perms,
@@ -1174,7 +1174,7 @@ impl<'a> Mailbox<'a> {
     /// Exports an [OwnedCapability] from this mailbox.
     ///
     /// This method is intended to be used to import a capability from a mailbox into a [Table].
-    pub fn export(&self, perms: Permissions) -> OwnedCapability {
+    pub fn export_owned(&self, perms: Permissions) -> OwnedCapability {
         OwnedCapability {
             inner: Capability {
                 address: self.address,

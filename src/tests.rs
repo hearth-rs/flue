@@ -5,7 +5,7 @@ async fn send_message() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.make_capability(Permissions::SEND);
+    let ad = mb.export(Permissions::SEND);
     ad.send(b"Hello world!", &[]).await.unwrap();
 
     assert!(mb
@@ -24,7 +24,7 @@ async fn send_address() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.make_capability(Permissions::SEND);
+    let ad = mb.export(Permissions::SEND);
     ad.send(b"", &[&ad]).await.unwrap();
 
     assert!(mb
@@ -45,7 +45,7 @@ async fn table_send_impls_send() {
     tokio::spawn(async move {
         let group = MailboxGroup::new(&table);
         let mb = group.create_mailbox().unwrap();
-        let ad = mb.make_capability(Permissions::SEND);
+        let ad = mb.export(Permissions::SEND);
         ad.send(b"Hello world!", &[]).await.unwrap();
 
         assert!(mb
@@ -70,7 +70,7 @@ async fn try_recv() {
 
     assert_eq!(mb.try_recv(|_| ()), Some(None));
 
-    let ad = mb.make_capability(Permissions::SEND);
+    let ad = mb.export(Permissions::SEND);
     ad.send(b"Hello world!", &[]).await.unwrap();
 
     assert!(mb
@@ -89,7 +89,7 @@ async fn deny_send() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.make_capability(Permissions::empty());
+    let ad = mb.export(Permissions::empty());
     let result = ad.send(b"", &[]).await;
     assert_eq!(result, Err(TableError::PermissionDenied));
 }
@@ -99,7 +99,7 @@ async fn deny_kill() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.make_capability(Permissions::empty());
+    let ad = mb.export(Permissions::empty());
     let result = ad.kill();
     assert_eq!(result, Err(TableError::PermissionDenied));
 }
@@ -109,7 +109,7 @@ async fn deny_link() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.make_capability(Permissions::empty());
+    let ad = mb.export(Permissions::empty());
     let result = ad.link(&mb);
     assert_eq!(result, Err(TableError::PermissionDenied));
 }
@@ -119,7 +119,7 @@ async fn deny_demote_escalation() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.make_capability(Permissions::KILL);
+    let ad = mb.export(Permissions::KILL);
     let result = ad.demote(Permissions::SEND);
     assert_eq!(result.unwrap_err(), TableError::PermissionDenied);
 }
@@ -129,7 +129,7 @@ async fn kill() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.make_capability(Permissions::KILL);
+    let ad = mb.export(Permissions::KILL);
     ad.kill().unwrap();
     assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
 }
@@ -139,7 +139,7 @@ async fn double_kill() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.make_capability(Permissions::KILL);
+    let ad = mb.export(Permissions::KILL);
     ad.kill().unwrap();
     ad.kill().unwrap();
     assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
@@ -150,7 +150,7 @@ async fn dropped_handles_are_freed() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.make_capability(Permissions::empty());
+    let ad = mb.export(Permissions::empty());
     let handle = ad.handle;
     assert!(table.is_valid(handle));
     drop(ad);
@@ -163,7 +163,7 @@ async fn kill_all_mailboxes() {
     let group = MailboxGroup::new(&table);
     let mb1 = group.create_mailbox().unwrap();
     let mb2 = group.create_mailbox().unwrap();
-    let ad = mb1.make_capability(Permissions::KILL);
+    let ad = mb1.export(Permissions::KILL);
     ad.kill().unwrap();
     assert_eq!(mb2.recv(|s| format!("{:?}", s)).await, None);
 }
@@ -178,7 +178,9 @@ async fn unlink_on_kill() {
     let s_group = MailboxGroup::new(&child);
     let s_mb = s_group.create_mailbox().unwrap();
 
-    let s_handle = table.import_owned(s_mb.export(Permissions::LINK | Permissions::KILL)).unwrap();
+    let s_handle = table
+        .import_owned(s_mb.export_owned(Permissions::LINK | Permissions::KILL))
+        .unwrap();
 
     let s_cap = CapabilityRef {
         table: &table,
@@ -200,7 +202,7 @@ async fn unlink_on_close() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let s_mb = group.create_mailbox().unwrap();
-    let s_cap = s_mb.make_capability(Permissions::LINK);
+    let s_cap = s_mb.export(Permissions::LINK);
     let object = group.create_mailbox().unwrap();
     s_cap.link(&object).unwrap();
     drop(s_mb);
@@ -222,7 +224,9 @@ async fn unlink_dead() {
     let s_group = MailboxGroup::new(&child);
     let s_mb = s_group.create_mailbox().unwrap();
 
-    let s_handle = table.import_owned(s_mb.export(Permissions::LINK | Permissions::KILL)).unwrap();
+    let s_handle = table
+        .import_owned(s_mb.export_owned(Permissions::LINK | Permissions::KILL))
+        .unwrap();
 
     let s_cap = CapabilityRef {
         table: &table,
@@ -244,7 +248,7 @@ async fn unlink_closed() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let s_mb = group.create_mailbox().unwrap();
-    let s_cap = s_mb.make_capability(Permissions::LINK);
+    let s_cap = s_mb.export(Permissions::LINK);
     let object = group.create_mailbox().unwrap();
     drop(s_mb);
     s_cap.link(&object).unwrap();

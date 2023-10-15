@@ -617,7 +617,7 @@ impl Table {
     }
 
     /// Helper function to directly insert a [Capability] into this table.
-    pub(crate) fn insert(&self, cap: Capability) -> CapabilityHandle {
+    pub(crate) fn import(&self, cap: Capability) -> CapabilityHandle {
         self.inner.lock().import(cap)
     }
 
@@ -625,7 +625,7 @@ impl Table {
     pub(crate) fn map_signal<'a>(&self, signal: RouteSignal<'a>) -> TableSignal<'a> {
         match signal {
             RouteSignal::Unlink { address } => TableSignal::Unlink {
-                handle: self.insert(Capability {
+                handle: self.import(Capability {
                     address,
                     perms: Permissions::empty(),
                 }),
@@ -1169,6 +1169,19 @@ impl<'a> Mailbox<'a> {
         CapabilityRef {
             table: self.group.table,
             handle,
+        }
+    }
+
+    /// Exports an [OwnedCapability] from this mailbox.
+    ///
+    /// This method is intended to be used to import a capability from a mailbox into a [Table].
+    pub fn export_owned(&self, perms: Permissions) -> OwnedCapability {
+        OwnedCapability {
+            inner: Capability {
+                address: self.address,
+                perms,
+            },
+            post: self.group.table.post.clone(),
         }
     }
 }

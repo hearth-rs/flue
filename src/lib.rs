@@ -465,6 +465,22 @@ pub struct OwnedCapability {
     post: Arc<PostOffice>,
 }
 
+impl PartialEq for OwnedCapability {
+    fn eq(&self, other: &Self) -> bool {
+        (self.inner == other.inner) && Arc::ptr_eq(&self.post, &other.post)
+    }
+}
+
+impl Eq for OwnedCapability {}
+
+impl Debug for OwnedCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedCapability")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
 /// An error in performing a capability operation in a [Table].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TableError {
@@ -1160,8 +1176,8 @@ impl<'a> Mailbox<'a> {
     }
 
     /// Exports a [CapabilityRef] to a [Table]
-    pub fn export(&self, perms: Permissions, table: &'a Table) -> TableResult<CapabilityRef<'a>>{
-        if !Arc::ptr_eq(&self.group.table.post, &table.post){
+    pub fn export(&self, perms: Permissions, table: &'a Table) -> TableResult<CapabilityRef<'a>> {
+        if !Arc::ptr_eq(&self.group.table.post, &table.post) {
             return Err(TableError::PostOfficeMismatch);
         }
         let handle = table.import(Capability {
@@ -1169,10 +1185,7 @@ impl<'a> Mailbox<'a> {
             perms,
         });
 
-        Ok(CapabilityRef {
-            table,
-            handle,
-        })
+        Ok(CapabilityRef { table, handle })
     }
 
     /// Exports an [OwnedCapability] from this mailbox.

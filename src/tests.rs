@@ -198,7 +198,7 @@ async fn export_different_table() {
     let ad1 = mb.export(Permissions::SEND, &table1).unwrap().to_owned();
     let ad2 = mb.export(Permissions::SEND, &table2).unwrap().to_owned();
 
-    assert_eq!(ad1.inner, ad2.inner);
+    assert_eq!(ad1, ad2);
 }
 
 #[tokio::test]

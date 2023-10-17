@@ -1159,17 +1159,20 @@ impl<'a> Mailbox<'a> {
         }
     }
 
-    /// Creates a capability within this mailbox's parent table to this mailbox's route.
-    pub fn export(&self, perms: Permissions) -> CapabilityRef<'a> {
-        let handle = self.group.table.import(Capability {
+    /// Exports a [CapabilityRef] to a [Table]
+    pub fn export(&self, perms: Permissions, table: &'a Table) -> TableResult<CapabilityRef<'a>>{
+        if !Arc::ptr_eq(&self.group.table.post, &table.post){
+            return Err(TableError::PostOfficeMismatch);
+        }
+        let handle = table.import(Capability {
             address: self.address,
             perms,
         });
 
-        CapabilityRef {
-            table: self.group.table,
+        Ok(CapabilityRef {
+            table,
             handle,
-        }
+        })
     }
 
     /// Exports an [OwnedCapability] from this mailbox.

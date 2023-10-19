@@ -116,9 +116,9 @@ bitflags::bitflags! {
         /// The permission to send messages to this capability.
         const SEND = 1 << 0;
 
-        /// The permission to link to this capability and be notified of its
+        /// The permission to monitor this capability and be notified of its
         /// closure.
-        const LINK = 1 << 1;
+        const MONITOR = 1 << 1;
 
         /// The permission to kill this capability.
         const KILL = 1 << 2;
@@ -128,7 +128,7 @@ bitflags::bitflags! {
 /// A non-owning signal using route addresses scoped within the post office.
 #[derive(Clone, Copy, Debug)]
 enum RouteSignal<'a> {
-    Unlink {
+    Down {
         address: RouteAddress,
     },
     Message {
@@ -142,7 +142,7 @@ impl<'a> NonOwningMessage<'a> for RouteSignal<'a> {
 
     fn to_owned(self) -> OwnedRouteSignal {
         match self {
-            RouteSignal::Unlink { address } => OwnedRouteSignal::Unlink { address },
+            RouteSignal::Down { address } => OwnedRouteSignal::Down { address },
             RouteSignal::Message { data, caps } => OwnedRouteSignal::Message {
                 data: data.to_vec(),
                 caps: caps.to_vec(),
@@ -155,7 +155,7 @@ impl<'a> NonOwningMessage<'a> for RouteSignal<'a> {
 ///
 /// Owning version of [RouteSignal].
 enum OwnedRouteSignal {
-    Unlink {
+    Down {
         address: RouteAddress,
     },
     Message {
@@ -169,7 +169,7 @@ impl OwningMessage for OwnedRouteSignal {
 
     fn to_non_owned(&self) -> Self::NonOwning<'_> {
         match self {
-            OwnedRouteSignal::Unlink { address } => RouteSignal::Unlink { address: *address },
+            OwnedRouteSignal::Down { address } => RouteSignal::Down { address: *address },
             OwnedRouteSignal::Message { data, caps } => RouteSignal::Message {
                 data: data.as_slice(),
                 caps: caps.as_slice(),
@@ -208,10 +208,10 @@ struct Route {
     /// The [RouteGroup] that this route is a member of.
     group: Option<Arc<Mutex<RouteGroup>>>,
 
-    /// A set of other routes that are linked to this route.
+    /// A set of other routes that are monitoring this route.
     ///
     /// This is taken when this route is closed.
-    linked_routes: Mutex<Option<HashSet<RouteAddress>>>,
+    monitors: Mutex<Option<HashSet<RouteAddress>>>,
 
     /// The generation of this route.
     ///
@@ -242,7 +242,7 @@ impl Default for Route {
         Self {
             tx: None,
             group: None,
-            linked_routes: Mutex::new(Some(HashSet::new())),
+            monitors: Mutex::new(Some(HashSet::new())),
             generation: 0,
         }
     }
@@ -252,7 +252,7 @@ impl Clear for Route {
     fn clear(&mut self) {
         self.tx.take();
         self.group.take();
-        self.linked_routes.lock().take();
+        self.monitors.lock().take();
         self.generation += 1;
     }
 }
@@ -267,7 +267,7 @@ struct RouteHandle(usize);
 /// Shared signal transport for all of the processes in a shared context.
 ///
 /// Post offices store pools of routes and manage their lifetimes. This includes
-/// sending signals, closing, killing, and linking them between each other.
+/// sending signals, closing, killing, and monitoring each other.
 ///
 /// Processes reference routes by their addresses, which along with
 /// [Permissions] compose a capability.
@@ -314,24 +314,25 @@ impl PostOffice {
         route.group.as_ref().unwrap().lock().kill(self);
     }
 
-    /// Closes a route, frees its entry, and unlinks all routes linked to it.
+    /// Closes a route, frees its entry, and sends down signals to all routes
+    /// monitoring it.
     pub(crate) fn close(self: &Arc<Self>, address: &RouteAddress) {
         let Some(route) = self.get_route(address) else {
             return;
         };
 
-        let Some(linked_routes) = route.linked_routes.lock().take() else {
+        let Some(monitors) = route.monitors.lock().take() else {
             return;
         };
 
         let address = *address;
         let post = self.to_owned();
 
-        // unlink asynchronously in order to return in constant time
-        // mitigates timing attacks and eliminates delays in large networks of links
+        // send down signals asynchronously in order to return in constant time
+        // mitigates timing attacks and eliminates delays
         tokio::spawn(async move {
-            for link in linked_routes {
-                post.send(&link, RouteSignal::Unlink { address }).await;
+            for monitor in monitors {
+                post.send(&monitor, RouteSignal::Down { address }).await;
             }
         });
 
@@ -372,19 +373,19 @@ impl PostOffice {
         fut.await;
     }
 
-    /// Links the object route to the subject route.
+    /// Monitors the subject route from the object route.
     ///
     /// When the subject route is closed, the object route will receive
-    /// [Signal::Unlink] with the subject's address.
-    pub(crate) fn link(self: &Arc<Self>, subject: &RouteAddress, object: &RouteAddress) {
-        // shorthand to immediately unlink if the route is closed at the
-        // time of linking
-        let unlink = || {
+    /// [Signal::Down] with the subject's address.
+    pub(crate) fn monitor(self: &Arc<Self>, subject: &RouteAddress, object: &RouteAddress) {
+        // shorthand to immediately send a down signal if the route is closed
+        // at the time of monitoring
+        let down = || {
             let subject = *subject;
             let object = *object;
             let post = self.to_owned();
             tokio::spawn(async move {
-                post.send(&object, RouteSignal::Unlink { address: subject })
+                post.send(&object, RouteSignal::Down { address: subject })
                     .await;
                 post.close(&subject);
             })
@@ -392,30 +393,30 @@ impl PostOffice {
 
         let Some(route) = self.get_route(subject) else {
             // if the address is invalid, the route must be closed
-            unlink();
+            down();
             return;
         };
 
-        let mut links_lock = route.linked_routes.lock();
-        let Some(linked_routes) = links_lock.as_mut() else {
-            // if links is taken, the route must be closed
-            unlink();
+        let mut monitors_lock = route.monitors.lock();
+        let Some(monitors) = monitors_lock.as_mut() else {
+            // if monitors is taken, the route must be closed
+            down();
             return;
         };
 
         let Some(tx) = &route.tx else {
             // if the sender has been removed, the route must be closed
-            unlink();
+            down();
             return;
         };
 
         if tx.receiver_count() == 0 {
             // if the receiver has hung up, the route must be closed
-            unlink();
+            down();
             return;
         }
 
-        linked_routes.insert(*object);
+        monitors.insert(*object);
     }
 
     /// Internal helper function to look up a route by address (including generation).
@@ -640,7 +641,7 @@ impl Table {
     /// Imports a table-less [Signal] to a table-local [ContextSignal].
     pub(crate) fn map_signal<'a>(&self, signal: RouteSignal<'a>) -> TableSignal<'a> {
         match signal {
-            RouteSignal::Unlink { address } => TableSignal::Unlink {
+            RouteSignal::Down { address } => TableSignal::Down {
                 handle: self.import(Capability {
                     address,
                     perms: Permissions::empty(),
@@ -656,7 +657,7 @@ impl Table {
     /// Imports a table-less [Signal] to a table-local [OwnedContextSignal].
     pub(crate) fn map_signal_owned(&self, signal: RouteSignal<'_>) -> OwnedTableSignal<'_> {
         match self.map_signal(signal) {
-            TableSignal::Unlink { handle } => OwnedTableSignal::Unlink {
+            TableSignal::Down { handle } => OwnedTableSignal::Down {
                 handle: self.wrap_handle(handle).unwrap(),
             },
             TableSignal::Message { data, caps } => OwnedTableSignal::Message {
@@ -758,32 +759,33 @@ impl Table {
         Ok(handle)
     }
 
-    /// Links a capability handle to a given mailbox.
+    /// Monitors a capability handle with a given mailbox.
     ///
-    /// When the capability's route is closed, the mailbox will receive an
-    /// unlink signal ([TableSignal::Unlink] or [OwnedTableSignal::Unlink])
-    /// with a capability handle of a demoted version of the linked capability
-    /// *but with no [Permissions]*.
+    /// When the capability's route is closed, the mailbox will receive a
+    /// down signal ([TableSignal::Down] or [OwnedTableSignal::Down])
+    /// with a capability handle of a demoted version of the monitored
+    /// capability *but with no [Permissions]*.
     ///
     /// Returns [TableError::PermissionDenied] if the capability does not have
-    /// [Permissions::LINK].
+    /// [Permissions::MONITOR].
     ///
     /// Returns [TableError::TableMismatch] if the mailbox belongs to a different [Table].
-    pub fn link(&self, handle: CapabilityHandle, mailbox: &Mailbox) -> TableResult<()> {
+    pub fn monitor(&self, handle: CapabilityHandle, mailbox: &Mailbox) -> TableResult<()> {
         if !std::ptr::eq(mailbox.group.table, self) {
             return Err(TableError::TableMismatch);
         }
+
         let inner = self.inner.lock();
         let entry = inner
             .entries
             .get(handle.0)
             .ok_or(TableError::InvalidHandle)?;
 
-        if !entry.cap.perms.contains(Permissions::LINK) {
+        if !entry.cap.perms.contains(Permissions::MONITOR) {
             return Err(TableError::PermissionDenied);
         }
 
-        self.post.link(&entry.cap.address, &mailbox.address);
+        self.post.monitor(&entry.cap.address, &mailbox.address);
         Ok(())
     }
 
@@ -930,19 +932,19 @@ impl<'a> CapabilityRef<'a> {
         })
     }
 
-    /// Links this capability handle to a given mailbox.
+    /// Monitors this capability handle from a given mailbox.
     ///
     /// When this capability's route is closed, the mailbox will receive an
-    /// unlink signal ([TableSignal::Unlink] or [OwnedTableSignal::Unlink])
+    /// down signal ([TableSignal::Down] or [OwnedTableSignal::Down])
     /// with a capability handle of a demoted version of this capability *but
     /// with no [Permissions]*.
     ///
     /// Returns [TableError::PermissionDenied] if this capability does not have
-    /// [Permissions::LINK].
+    /// [Permissions::MONITOR].
     ///
     /// Panics if the mailbox's table is not this table.
-    pub fn link(&self, mailbox: &Mailbox<'a>) -> TableResult<()> {
-        self.table.link(self.handle, mailbox)
+    pub fn monitor(&self, mailbox: &Mailbox<'a>) -> TableResult<()> {
+        self.table.monitor(self.handle, mailbox)
     }
 
     /// Sends a message to this capability handle.
@@ -988,10 +990,10 @@ impl<'a> CapabilityRef<'a> {
 /// vulnerabilities.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TableSignal<'a> {
-    /// A notification that a capability linked to this mailbox has been killed.
-    Unlink {
+    /// A notification that a capability monitored by this mailbox has been killed.
+    Down {
         /// An owning handle of a demoted version of the capability that was
-        /// originally linked but with no [Permissions].
+        /// originally monitored but with no [Permissions].
         handle: CapabilityHandle,
     },
 
@@ -1013,10 +1015,10 @@ pub enum TableSignal<'a> {
 /// not to the receiving of the message.
 #[derive(Clone, Debug)]
 pub enum OwnedTableSignal<'a> {
-    /// A notification that a capability linked to this mailbox has been killed.
-    Unlink {
+    /// A notification that a capability monitored by this mailbox has been killed.
+    Down {
         /// An owning handle of a demoted version of the capability that was
-        /// originally linked but with no [Permissions].
+        /// originally monitored but with no [Permissions].
         handle: CapabilityRef<'a>,
     },
 
@@ -1087,10 +1089,9 @@ impl<'a> MailboxGroup<'a> {
 /// A receiver for [TableSignals][TableSignal].
 ///
 /// Processes create mailboxes in order to receive signals from other processes.
-/// A process can close a mailbox, unlinking it from the other processes, or
-/// a mailbox can be killed by other processes using [Permissions::KILL] on a
-/// mailbox's capability. When a mailbox is killed, all of the other mailboxes
-/// in its [MailboxGroup] are killed as well.
+/// A process can close a mailbox or a mailbox can be killed by other processes
+/// using [Permissions::KILL] on a mailbox's capability. When a mailbox is
+/// killed, all of the other mailboxes in its [MailboxGroup] are killed as well.
 ///
 /// To get started using mailboxes, see [Mailbox::recv]. If you don't need to
 /// process zero-copy signals, you can call [Mailbox::recv_owned] instead.

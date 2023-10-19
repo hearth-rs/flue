@@ -124,12 +124,12 @@ async fn deny_kill() {
 }
 
 #[tokio::test]
-async fn deny_link() {
+async fn deny_monitor() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
     let ad = mb.export(Permissions::empty(), &table).unwrap();
-    let result = ad.link(&mb);
+    let result = ad.monitor(&mb);
     assert_eq!(result, Err(TableError::PermissionDenied));
 }
 
@@ -202,7 +202,7 @@ async fn export_different_table() {
 }
 
 #[tokio::test]
-async fn unlink_on_kill() {
+async fn down_on_kill() {
     let table = Table::default();
     let o_group = MailboxGroup::new(&table);
     let object = o_group.create_mailbox().unwrap();
@@ -212,7 +212,7 @@ async fn unlink_on_kill() {
     let s_mb = s_group.create_mailbox().unwrap();
 
     let s_handle = table
-        .import_owned(s_mb.export_owned(Permissions::LINK | Permissions::KILL))
+        .import_owned(s_mb.export_owned(Permissions::MONITOR | Permissions::KILL))
         .unwrap();
 
     let s_cap = CapabilityRef {
@@ -220,10 +220,10 @@ async fn unlink_on_kill() {
         handle: s_handle,
     };
 
-    s_cap.link(&object).unwrap();
+    s_cap.monitor(&object).unwrap();
     s_cap.kill().unwrap();
 
-    let expected = TableSignal::Unlink {
+    let expected = TableSignal::Down {
         handle: s_cap.demote(Permissions::empty()).unwrap().handle,
     };
 
@@ -231,16 +231,16 @@ async fn unlink_on_kill() {
 }
 
 #[tokio::test]
-async fn unlink_on_close() {
+async fn down_on_close() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let s_mb = group.create_mailbox().unwrap();
-    let s_cap = s_mb.export(Permissions::LINK, &table).unwrap();
+    let s_cap = s_mb.export(Permissions::MONITOR, &table).unwrap();
     let object = group.create_mailbox().unwrap();
-    s_cap.link(&object).unwrap();
+    s_cap.monitor(&object).unwrap();
     drop(s_mb);
 
-    let expected = TableSignal::Unlink {
+    let expected = TableSignal::Down {
         handle: s_cap.demote(Permissions::empty()).unwrap().handle,
     };
 
@@ -248,7 +248,7 @@ async fn unlink_on_close() {
 }
 
 #[tokio::test]
-async fn unlink_dead() {
+async fn down_dead() {
     let table = Table::default();
     let o_group = MailboxGroup::new(&table);
     let object = o_group.create_mailbox().unwrap();
@@ -258,7 +258,7 @@ async fn unlink_dead() {
     let s_mb = s_group.create_mailbox().unwrap();
 
     let s_handle = table
-        .import_owned(s_mb.export_owned(Permissions::LINK | Permissions::KILL))
+        .import_owned(s_mb.export_owned(Permissions::MONITOR | Permissions::KILL))
         .unwrap();
 
     let s_cap = CapabilityRef {
@@ -267,9 +267,9 @@ async fn unlink_dead() {
     };
 
     s_cap.kill().unwrap();
-    s_cap.link(&object).unwrap();
+    s_cap.monitor(&object).unwrap();
 
-    let expected = TableSignal::Unlink {
+    let expected = TableSignal::Down {
         handle: s_cap.demote(Permissions::empty()).unwrap().handle,
     };
 
@@ -277,16 +277,16 @@ async fn unlink_dead() {
 }
 
 #[tokio::test]
-async fn unlink_closed() {
+async fn down_closed() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let s_mb = group.create_mailbox().unwrap();
-    let s_cap = s_mb.export(Permissions::LINK, &table).unwrap();
+    let s_cap = s_mb.export(Permissions::MONITOR, &table).unwrap();
     let object = group.create_mailbox().unwrap();
     drop(s_mb);
-    s_cap.link(&object).unwrap();
+    s_cap.monitor(&object).unwrap();
 
-    let expected = TableSignal::Unlink {
+    let expected = TableSignal::Down {
         handle: s_cap.demote(Permissions::empty()).unwrap().handle,
     };
 

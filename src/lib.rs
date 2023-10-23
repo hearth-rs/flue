@@ -967,8 +967,6 @@ impl<'a> CapabilityRef<'a> {
     ///
     /// Returns [TableError::PermissionDenied] if this capability does not have
     /// [Permissions::MONITOR].
-    ///
-    /// Panics if the mailbox's table is not this table.
     pub fn monitor(&self, mailbox: &Mailbox<'a>) -> TableResult<()> {
         self.table.monitor(self.handle, mailbox)
     }

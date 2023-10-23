@@ -106,10 +106,11 @@ where
     /// popped. Otherwise, this function waits for the sender to send
     /// non-owning data, which may be used directly.
     ///
-    /// In order to preserve the safety of non-owning messages, the sender
-    /// cannot finish sending a non-owning message until this function's
-    /// closure has finished executing. **Exit the closure as quickly and as
-    /// quickly as possible to avoid timing attack vulnerabilities.**
+    /// In order to preserve the memory safety of non-owning messages that are
+    /// borrowed from the sender by the receiver, the sender cannot finish
+    /// sending a non-owning message until this function's closure has finished
+    /// executing. **Exit the closure as quickly and in as consistent of time
+    /// as possible to avoid timing attack vulnerabilities.**
     pub async fn recv<R>(
         &self,
         mut f: impl for<'a> FnMut(T::NonOwning<'a>) -> R,

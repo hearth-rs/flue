@@ -112,7 +112,7 @@ where
     /// executing. **Exit the closure in as constant of a time as possible to
     /// avoid timing attack vulnerabilities.** Performing operations on the
     /// incoming signals that are purely dependent on the input, such as
-    /// deserializing message data, don't give up any information about the
+    /// deserializing message data, doesn't give up any information about the
     /// receiver's state, so that's an example of an acceptable use of this
     /// closure.
     pub async fn recv<R>(

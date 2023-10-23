@@ -19,17 +19,43 @@
 
 //! Flue is an efficient and secure actor runtime library.
 //!
-//! The fundamental building block in Flue is the **process**: a concurrent
-//! execution thread with private memory. Processes may only communicate by
-//! passing **signals** between each other. Signals are sent to **routes** and
-//! received using **mailboxes**. All routes in a **route group** are killed if
-//! any of them are killed. The **post office** contains all of the routes in a
-//! set of communicating processes. **Capabilities** both reference and limit
-//! access to routes using fine-grained permission flags. **Tables** are stores
-//! of integer-addressed, unforgeable capabilities.
+//! Flue's purpose is to be a support library for concurrency-oriented
+//! programs using **processes**: concurrent execution threads with private
+//! memory. Processes may only communicate by passing **signals** between each
+//! other. Signals are sent to **routes** and received using **mailboxes**. All
+//! routes in a **route group** are killed if any of them are killed. The **post
+//! office** contains all of the routes in a set of communicating processes.
+//! **Capabilities** both reference and limit access to routes using fine-
+//! grained permission flags. **Tables** are stores of integer- addressed,
+//! unforgeable capabilities.
+//!
+//! Although Flue provides the low-level support framework and data model
+//! for building process-based concurrent programs, it does *NOT* provide a
+//! high-level definition or data type for processes themselves. Users of the
+//! Flue library must combine Flue's components with their application's
+//! specific data model in order to find the best architecture for their
+//! concurrent system.
 //!
 //! Please note that signals may **only** be sent to routes and that mailboxes
 //! may **only** receive signals through the routes that they are bound to.
+//!
+//! Capabilities may be used to perform the following operations on their
+//! routes, each of which are guarded by their respective permission flag:
+//! 1. **Kill**: Forcibly terminate the route and all of the other routes in its
+//!    route group, preventing them from receiving any further messages.
+//! 2. **Send**: Send a "message" signal to the destination route
+//!    comprised of data (a simple byte buffer) and a list of capabilities to be
+//!    imported into the route's mailbox's table.
+//! 3. **Monitor**: Configures a given mailbox to monitor the capability's
+//!    route. When the route is closed, either by choice or because of it being
+//!    killed, the mailbox receives a "down" signal with a permission-less
+//!    capability to the monitored route. If the route is already closed at the
+//!    time of monitoring, the mailbox will immediately receive the down signal.
+//!
+//! A capability may also be "demoted" to a new capability that refers to the
+//! same route but with a subset of the original's permissions. This can be
+//! used to limit another's process access to a route by restricting the
+//! permission flags on the route's capability that is sent to that process.
 //!
 //! Flue is made for the purpose of efficiently executing potentially untrusted
 //! process code, so to support running that code, Flue's security model has

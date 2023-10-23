@@ -109,8 +109,12 @@ where
     /// In order to preserve the memory safety of non-owning messages that are
     /// borrowed from the sender by the receiver, the sender cannot finish
     /// sending a non-owning message until this function's closure has finished
-    /// executing. **Exit the closure as quickly and in as consistent of time
-    /// as possible to avoid timing attack vulnerabilities.**
+    /// executing. **Exit the closure in as constant of a time as possible to
+    /// avoid timing attack vulnerabilities.** Performing operations on the
+    /// incoming signals that are purely dependent on the input, such as
+    /// deserializing message data, don't give up any information about the
+    /// receiver's state, so that's an example of an acceptable use of this
+    /// closure.
     pub async fn recv<R>(
         &self,
         mut f: impl for<'a> FnMut(T::NonOwning<'a>) -> R,

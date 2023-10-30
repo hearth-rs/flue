@@ -1,4 +1,5 @@
 // Copyright (c) 2023 Marceline Cramer
+// Copyright (c) 2023 Roux
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // This file is part of Flue.
@@ -16,6 +17,103 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with Flue. If not, see <https://www.gnu.org/licenses/>.
 
+//! Flue is an efficient and secure actor runtime library.
+//!
+//! Flue's purpose is to be a support library for concurrency-oriented
+//! programs using **processes**: concurrent execution threads with private
+//! memory. Processes may only communicate by passing **signals** between each
+//! other. Signals are sent to **routes** and received using **mailboxes**. All
+//! routes in a **route group** are killed if any of them are killed. The **post
+//! office** contains all of the routes in a set of communicating processes.
+//! **Capabilities** both reference and limit access to routes using fine-
+//! grained permission flags. **Tables** are stores of integer- addressed,
+//! unforgeable capabilities.
+//!
+//! Although Flue provides the low-level support framework and data model
+//! for building process-based concurrent programs, it does *NOT* provide a
+//! high-level definition or data type for processes themselves. Users of the
+//! Flue library must combine Flue's components with their application's
+//! specific data model in order to find the best architecture for their
+//! concurrent system.
+//!
+//! Please note that signals may **only** be sent to routes and that mailboxes
+//! may **only** receive signals through the routes that they are bound to.
+//!
+//! Capabilities may be used to perform the following operations on their
+//! routes, each of which are guarded by their respective permission flag:
+//! 1. **Kill**: Forcibly terminate the route and all of the other routes in its
+//!    route group, preventing them from receiving any further messages.
+//! 2. **Send**: Send a "message" signal to the destination route
+//!    comprised of data (a simple byte buffer) and a list of capabilities to be
+//!    imported into the route's mailbox's table.
+//! 3. **Monitor**: Configures a given mailbox to monitor the capability's
+//!    route. When the route is closed, either by choice or because of it being
+//!    killed, the mailbox receives a "down" signal with a permission-less
+//!    capability to the monitored route. If the route is already closed at the
+//!    time of monitoring, the mailbox will immediately receive the down signal.
+//!
+//! A capability may also be "demoted" to a new capability that refers to the
+//! same route but with a subset of the original's permissions. This can be
+//! used to limit another's process access to a route by restricting the
+//! permission flags on the route's capability that is sent to that process.
+//!
+//! Flue is made for the purpose of efficiently executing potentially untrusted
+//! process code, so to support running that code, Flue's security model has
+//! the following axioms:
+//! - Routes can only be accessed by a process if a capability to that route
+//!   has explicitly been passed to that process in a signal. You may sandbox
+//!   a process on a fine-grained level by limiting which capabilities get
+//!   passed to it.
+//! - Capabilities may only be created from other capabilities with either an
+//!   identical set or a subset of the original's permissions. Permission
+//!   escalation by untrusted processes is impossible.
+//!
+//! Here's a box diagram of two processes who each have a mailbox and a
+//! capability to the other's mailbox to help explain the mental model of a
+//! full Flue-based actor system:
+//!
+//! ```text
+//!         Process A              Post Office               Process B
+//! ┌───────────────────────┐    ┌─────────────┐     ┌───────────────────────┐
+//! │         Table         │    │             │     │         Table         │
+//! │ ┌───────────────────┐ │    │ ┌─────────┐ │     │ ┌───────────────────┐ │
+//! │ │                   │ │    │ │         │ │     │ │                   │ │
+//! │ │ ┌───────────────┐ │ │ ┌──┼─► Route B ├─┼───┐ │ │ ┌───────────────┐ │ │
+//! │ │ │ Capability A  ├─┼─┼─┘  │ │         │ │   │ │ │ │ Capability B  ├─┼─┼─┐
+//! │ │ └───────────────┘ │ │    │ └─────────┘ │   │ │ │ └───────────────┘ │ │ │
+//! │ │                   │ │    │             │   │ │ │                   │ │ │
+//! │ └────────▲──────────┘ │    │ ┌─────────┐ │   │ │ └────────▲──────────┘ │ │
+//! │          │            │    │ │         │ │   │ │          │            │ │
+//! │   ┌──────┴───────┐    │ ┌──┼─┤ Route A ◄─┼─┐ │ │   ┌──────┴───────┐    │ │
+//! │   │   Mailbox A  ◄────┼─┘  │ │         │ │ │ └─┼───►   Mailbox B  │    │ │
+//! │   └──────────────┘    │    │ └─────────┘ │ │   │   └──────────────┘    │ │
+//! │                       │    │             │ │   │                       │ │
+//! └───────────────────────┘    └─────────────┘ │   └───────────────────────┘ │
+//!                                              │                             │
+//!                                              └─────────────────────────────┘
+//! ```
+//!
+//! Both processes share a post office, and mailboxes A and B have associated
+//! routes A and B in that mailbox. Capability A belongs in process A's table
+//! and references route B, and capability B lives in process B's table and
+//! references route A. Mailboxes A and B reference their associated process's
+//! table so that when they receive capabilities, they can insert those
+//! capabilities into their process's table.
+//!
+//! To send a message signal from process A to process B using capability A,
+//! Flue performs the following steps on that message:
+//! 1. Process A's table confirms that capability A does indeed have the
+//!    permission to send messages.
+//! 2. Process A's table sends the message to route B's address in the post
+//!    office.
+//! 3. The post office looks up route B by address, finds mailbox B's zero-copy
+//!    message channel, and uses it to send the message.
+//! 4. The message waits in mailbox B's queue until mailbox B receives it.
+//! 5. Mailbox B processes the message and inserts any capabilities inside of
+//!    it into process B's table.
+
+#![warn(missing_docs)]
+
 use std::{
     collections::{HashMap, HashSet},
     fmt::{Debug, Display},
@@ -27,6 +125,9 @@ use parking_lot::Mutex;
 use sharded_slab::{Clear, Pool};
 use slab::Slab;
 use zerocopy::{channel, NonOwningMessage, OwningMessage, Receiver, Sender};
+
+#[cfg(test)]
+mod tests;
 
 pub mod zerocopy;
 
@@ -41,19 +142,20 @@ bitflags::bitflags! {
         /// The permission to send messages to this capability.
         const SEND = 1 << 0;
 
-        /// The permission to link to this capability and be notified of its
+        /// The permission to monitor this capability and be notified of its
         /// closure.
-        const LINK = 1 << 1;
+        const MONITOR = 1 << 1;
 
         /// The permission to kill this capability.
         const KILL = 1 << 2;
     }
 }
 
+/// A non-owning signal using route addresses scoped within the post office.
 #[derive(Clone, Copy, Debug)]
-enum Signal<'a> {
-    Unlink {
-        address: Address,
+enum RouteSignal<'a> {
+    Down {
+        address: RouteAddress,
     },
     Message {
         data: &'a [u8],
@@ -61,13 +163,13 @@ enum Signal<'a> {
     },
 }
 
-impl<'a> NonOwningMessage<'a> for Signal<'a> {
-    type Owning = OwnedSignal;
+impl<'a> NonOwningMessage<'a> for RouteSignal<'a> {
+    type Owning = OwnedRouteSignal;
 
-    fn to_owned(self) -> OwnedSignal {
+    fn to_owned(self) -> OwnedRouteSignal {
         match self {
-            Signal::Unlink { address } => OwnedSignal::Unlink { address },
-            Signal::Message { data, caps } => OwnedSignal::Message {
+            RouteSignal::Down { address } => OwnedRouteSignal::Down { address },
+            RouteSignal::Message { data, caps } => OwnedRouteSignal::Message {
                 data: data.to_vec(),
                 caps: caps.to_vec(),
             },
@@ -75,9 +177,12 @@ impl<'a> NonOwningMessage<'a> for Signal<'a> {
     }
 }
 
-enum OwnedSignal {
-    Unlink {
-        address: Address,
+/// An owning signal using route addresses scoped within the post office.
+///
+/// Owning version of [RouteSignal].
+enum OwnedRouteSignal {
+    Down {
+        address: RouteAddress,
     },
     Message {
         data: Vec<u8>,
@@ -85,13 +190,13 @@ enum OwnedSignal {
     },
 }
 
-impl OwningMessage for OwnedSignal {
-    type NonOwning<'a> = Signal<'a>;
+impl OwningMessage for OwnedRouteSignal {
+    type NonOwning<'a> = RouteSignal<'a>;
 
     fn to_non_owned(&self) -> Self::NonOwning<'_> {
         match self {
-            OwnedSignal::Unlink { address } => Signal::Unlink { address: *address },
-            OwnedSignal::Message { data, caps } => Signal::Message {
+            OwnedRouteSignal::Down { address } => RouteSignal::Down { address: *address },
+            OwnedRouteSignal::Message { data, caps } => RouteSignal::Message {
                 data: data.as_slice(),
                 caps: caps.as_slice(),
             },
@@ -99,12 +204,15 @@ impl OwningMessage for OwnedSignal {
     }
 }
 
+/// Shared state for a group of routes that are all killed when any of them
+/// are killed.
 struct RouteGroup {
-    addresses: HashSet<Address>,
+    addresses: HashSet<RouteAddress>,
     dead: bool,
 }
 
 impl RouteGroup {
+    /// Kills this route group exactly once.
     pub fn kill(&mut self, post: &Arc<PostOffice>) {
         if self.dead {
             return;
@@ -118,10 +226,40 @@ impl RouteGroup {
     }
 }
 
+/// A clearable connection to a [Mailbox]. Addressed in [PostOffice] by [RouteAddress].
 struct Route {
-    tx: Option<Sender<OwnedSignal>>,
+    /// A sender to this route's associated [Mailbox].
+    tx: Option<Sender<OwnedRouteSignal>>,
+
+    /// The [RouteGroup] that this route is a member of.
     group: Option<Arc<Mutex<RouteGroup>>>,
-    links: Mutex<HashSet<Address>>,
+
+    /// A set of other routes that are monitoring this route.
+    ///
+    /// This is taken when this route is closed.
+    monitors: Mutex<Option<HashSet<RouteAddress>>>,
+
+    /// The generation of this route.
+    ///
+    /// Because [Pool] can allocate a new route with a reused [RouteHandle]
+    /// to an old route that has been closed, using [RouteHandle] alone to
+    /// access routes could potentially lead to outstanding handles to the old
+    /// route instead sending signals to new routes. Instead of a complicated,
+    /// inefficient garbage collection or reference counting system that can
+    /// ensure that routes are never freed until all of their references are
+    /// gone, we simply store a persistent generation counter that is
+    /// incremented whenever the route at its handle is closed. Then, the
+    /// generation is used together with [RouteHandle] in [RouteAddress] to
+    /// access routes.
+    ///
+    /// Note that the [sharded_slab] crate we're using also has a
+    /// [sharded_slab::Slab] type that includes the generation in its handle,
+    /// however, that generation has only a handful of bits available because
+    /// other data needs to be included in the bits of a `usize`. Very old
+    /// route handles could potentially refer to new routes if that generation
+    /// overflows. Instead, we manually use the [Pool] type so that we can use
+    /// a full `u32` to represent the generation that will never overflow in
+    /// practice.
     generation: u32,
 }
 
@@ -130,7 +268,7 @@ impl Default for Route {
         Self {
             tx: None,
             group: None,
-            links: Mutex::new(HashSet::new()),
+            monitors: Mutex::new(Some(HashSet::new())),
             generation: 0,
         }
     }
@@ -140,12 +278,25 @@ impl Clear for Route {
     fn clear(&mut self) {
         self.tx.take();
         self.group.take();
-        self.links.lock().clear();
+        self.monitors.lock().take();
         self.generation += 1;
     }
 }
 
+/// A handle to a route.
+///
+/// Routes are stored in the [PostOffice]'s pool and are indexed by a `usize`.
+/// This struct is used to store the handle of a route in its corresponding [RouteAddress].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct RouteHandle(usize);
+
 /// Shared signal transport for all of the processes in a shared context.
+///
+/// Post offices store pools of routes and manage their lifetimes. This includes
+/// sending signals, closing, killing, and monitoring each other.
+///
+/// Processes reference routes by their addresses, which along with
+/// [Permissions] compose a capability.
 ///
 /// Instantiate one [PostOffice] per collection of interoperating processes,
 /// and use it in [Table::new] to create a new capability table.
@@ -161,18 +312,27 @@ impl PostOffice {
         })
     }
 
-    pub(crate) fn insert(&self, tx: Sender<OwnedSignal>, group: Arc<Mutex<RouteGroup>>) -> Address {
+    /// Inserts a new route into this post office and returns its new [RouteAddress].
+    pub(crate) fn insert(
+        &self,
+        tx: Sender<OwnedRouteSignal>,
+        group: Arc<Mutex<RouteGroup>>,
+    ) -> RouteAddress {
         let mut route = self.routes.create().unwrap();
         route.tx = Some(tx);
         route.group = Some(group);
 
-        Address {
-            handle: route.key(),
+        RouteAddress {
+            handle: RouteHandle(route.key()),
             generation: route.generation,
         }
     }
 
-    pub(crate) fn kill(self: &Arc<Self>, address: &Address) {
+    /// Kills this route's route group.
+    ///
+    /// [RouteGroup::kill] calls [Self::close] on all of the route's group's
+    /// members as a side effect of this function.
+    pub(crate) fn kill(self: &Arc<Self>, address: &RouteAddress) {
         let Some(route) = self.get_route(address) else {
             return;
         };
@@ -180,25 +340,39 @@ impl PostOffice {
         route.group.as_ref().unwrap().lock().kill(self);
     }
 
-    pub(crate) fn close(self: &Arc<Self>, address: &Address) {
+    /// Closes a route, frees its entry, and sends down signals to all routes
+    /// monitoring it.
+    pub(crate) fn close(self: &Arc<Self>, address: &RouteAddress) {
         let Some(route) = self.get_route(address) else {
             return;
         };
 
+        let Some(monitors) = route.monitors.lock().take() else {
+            return;
+        };
+
         let address = *address;
-        let links = route.links.lock().to_owned();
         let post = self.to_owned();
 
+        // send down signals asynchronously in order to return in constant time
+        // mitigates timing attacks and eliminates delays
         tokio::spawn(async move {
-            for link in links {
-                post.send(&link, Signal::Unlink { address }).await;
+            for monitor in monitors {
+                post.send(&monitor, RouteSignal::Down { address }).await;
             }
         });
 
-        self.routes.clear(address.handle);
+        // mark this route for clearing
+        self.routes.clear(address.handle.0);
     }
 
-    pub(crate) async fn send(self: &Arc<Self>, address: &Address, signal: Signal<'_>) {
+    /// Sends a signal to a route by address.
+    ///
+    /// This function is async because zero-copy signal sending needs to wait
+    /// for the receiver to finish receiving before the signal's memory can be
+    /// safely destroyed.
+    pub(crate) async fn send(self: &Arc<Self>, address: &RouteAddress, signal: RouteSignal<'_>) {
+        // nest in block to make this function's future impl Send
         let result = {
             let Some(route) = self.get_route(address) else {
                 return;
@@ -210,9 +384,7 @@ impl PostOffice {
             };
 
             // send signal
-            let result = tx.send(signal);
-
-            result
+            tx.send(signal)
         };
 
         // close this route if the receiver was dropped
@@ -227,39 +399,55 @@ impl PostOffice {
         fut.await;
     }
 
-    pub(crate) fn link(self: &Arc<Self>, subject: &Address, object: &Address) {
-        // shorthand to immediately unlink
-        let unlink = || {
+    /// Monitors the subject route from the object route.
+    ///
+    /// When the subject route is closed, the object route will receive
+    /// [Signal::Down] with the subject's address.
+    pub(crate) fn monitor(self: &Arc<Self>, subject: &RouteAddress, object: &RouteAddress) {
+        // shorthand to immediately send a down signal if the route is closed
+        // at the time of monitoring
+        let down = || {
             let subject = *subject;
             let object = *object;
             let post = self.to_owned();
             tokio::spawn(async move {
-                post.send(&object, Signal::Unlink { address: subject })
+                post.send(&object, RouteSignal::Down { address: subject })
                     .await;
                 post.close(&subject);
             })
         };
 
         let Some(route) = self.get_route(subject) else {
-            unlink();
+            // if the address is invalid, the route must be closed
+            down();
+            return;
+        };
+
+        let mut monitors_lock = route.monitors.lock();
+        let Some(monitors) = monitors_lock.as_mut() else {
+            // if monitors is taken, the route must be closed
+            down();
             return;
         };
 
         let Some(tx) = &route.tx else {
-            unlink();
+            // if the sender has been removed, the route must be closed
+            down();
             return;
         };
 
         if tx.receiver_count() == 0 {
-            unlink();
+            // if the receiver has hung up, the route must be closed
+            down();
             return;
         }
 
-        route.links.lock().insert(*object);
+        monitors.insert(*object);
     }
 
-    fn get_route(&self, address: &Address) -> Option<impl Deref<Target = Route> + '_> {
-        let route = self.routes.get(address.handle)?;
+    /// Internal helper function to look up a route by address (including generation).
+    fn get_route(&self, address: &RouteAddress) -> Option<impl Deref<Target = Route> + '_> {
+        let route = self.routes.get(address.handle.0)?;
 
         if route.generation != address.generation {
             None
@@ -269,15 +457,23 @@ impl PostOffice {
     }
 }
 
+/// An address of a signal route in a [PostOffice].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Address {
-    pub handle: usize,
+pub(crate) struct RouteAddress {
+    /// The index of this route in the post office's route pool.
+    pub handle: RouteHandle,
+
+    /// The generation of this address's handle.
     pub generation: u32,
 }
 
+/// A capability to a route in a [PostOffice].
+///
+/// This includes both the [RouteAddress] of the route and the [Permissions] of
+/// the operations that can be performed on that route with this capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Capability {
-    pub address: Address,
+    pub address: RouteAddress,
     pub perms: Permissions,
 }
 
@@ -287,13 +483,29 @@ pub(crate) struct Capability {
 /// table to another without needing to send and receive messages.
 ///
 /// You can get and insert owned capabilities using [Table::get_owned] and
-/// [Table::insert_owned]. Please keep in mind that owned capabilities have
+/// [Table::import_owned]. Please keep in mind that owned capabilities have
 /// an `Arc<PostOffice>` inside and are thus relatively expensive to clone and
 /// destroy. Minimize their usage in performance-critical code.
 #[derive(Clone)]
 pub struct OwnedCapability {
     inner: Capability,
     post: Arc<PostOffice>,
+}
+
+impl PartialEq for OwnedCapability {
+    fn eq(&self, other: &Self) -> bool {
+        (self.inner == other.inner) && Arc::ptr_eq(&self.post, &other.post)
+    }
+}
+
+impl Eq for OwnedCapability {}
+
+impl Debug for OwnedCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedCapability")
+            .field("inner", &self.inner)
+            .finish()
+    }
 }
 
 /// An error in performing a capability operation in a [Table].
@@ -304,13 +516,24 @@ pub enum TableError {
 
     /// A handle used in this table operation does not have sufficient permissions.
     PermissionDenied,
+
+    /// A handle used in this table operation belongs to a different post office
+    /// than the one referenced by this table.
+    PostOfficeMismatch,
+
+    /// Something in this operation belongs to a different table than expected
+    TableMismatch,
 }
+
+type TableResult<T> = Result<T, TableError>;
 
 impl Display for TableError {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             TableError::InvalidHandle => write!(fmt, "invalid handle"),
             TableError::PermissionDenied => write!(fmt, "permission denied"),
+            TableError::PostOfficeMismatch => write!(fmt, "post office mismatch"),
+            TableError::TableMismatch => write!(fmt, "table mismatch"),
         }
     }
 }
@@ -320,44 +543,59 @@ impl std::error::Error for TableError {}
 #[derive(Debug)]
 struct TableEntry {
     cap: Capability,
-    refs: usize,
+    ref_count: usize,
 }
 
+/// Mutable state in a [Table]. Stores the table's capabilities, their
+/// reference counts, and a capability-keyed reverse lookup table of existing
+/// entries.
 struct TableInner {
     entries: Slab<TableEntry>,
-    reverse_entries: HashMap<Capability, usize>,
+    reverse_entries: HashMap<Capability, CapabilityHandle>,
 }
 
 impl TableInner {
-    pub fn insert(&mut self, cap: Capability) -> usize {
+    /// Inserts a [Capability] into this table. Reuses existing capability
+    /// handles and increments their reference count if available.
+    pub fn import(&mut self, cap: Capability) -> CapabilityHandle {
         use std::collections::hash_map::Entry;
         let entry = self.reverse_entries.entry(cap);
         match entry {
             Entry::Occupied(handle) => {
                 let handle = *handle.get();
-                self.entries.get_mut(handle).unwrap().refs += 1;
+                self.entries.get_mut(handle.0).unwrap().ref_count += 1;
                 handle
             }
             Entry::Vacant(reverse_entry) => {
-                let refs = 1;
-                let entry = TableEntry { cap, refs };
+                let ref_count = 1;
+                let entry = TableEntry { cap, ref_count };
                 let handle = self.entries.insert(entry);
-                reverse_entry.insert(handle);
-                handle
+                reverse_entry.insert(CapabilityHandle(handle));
+                CapabilityHandle(handle)
             }
         }
     }
 }
 
+/// An integer handle to a capability within a [Table].
+///
+/// This is a low-level type for directing managing capability handles. You
+/// should manually call [Table::inc_ref] and [Table::dec_ref] for the lifetime
+/// of this type. If you're looking for a friendlier capability API, check out
+/// [CapabilityRef].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapabilityHandle(pub usize);
+
 /// Contains unforgeable capabilities, performs operations on them, and moderates
 /// access to them.
 ///
-/// Each capability in a [Table] is referenced by an opaque integer handle.
-/// Handles are reference-counted, and are freed when their refcount hits zero.
+/// Each capability in a [Table] is referenced by an opaque integer handle,
+/// stored in the [CapabilityHandle] type. Handles are reference-counted, and
+/// are freed when their refcount hits zero.
 ///
 /// This struct has low-level operations on capability handles, but unless
 /// you're doing low-level integration of a table into a scripting environment,
-/// you probably want to use [CapabilityHandle] instead, which provides some
+/// you probably want to use [CapabilityRef] instead, which provides some
 /// higher-level abstraction for handle ownership.
 ///
 /// All incoming capabilities to this table are mapped to handles, and identical
@@ -365,7 +603,7 @@ impl TableInner {
 /// have the same integer value, then they are identical. Please note that
 /// the equivalence of capabilities is determined by both that capability's
 /// address (the route it actually points to) **AND** its [Permissions]. Two
-/// capabilities can point to the same route but be unequivalent because they
+/// capabilities can point to the same route but be nonequivalent because they
 /// have different permissions, so proceed with caution.
 pub struct Table {
     post: Arc<PostOffice>,
@@ -397,12 +635,12 @@ impl Table {
     }
 
     /// Gets an [OwnedCapability] by handle.
-    pub fn get_owned(&self, handle: usize) -> Result<OwnedCapability, TableError> {
+    pub fn get_owned(&self, handle: CapabilityHandle) -> TableResult<OwnedCapability> {
         let inner = self
             .inner
             .lock()
             .entries
-            .get(handle)
+            .get(handle.0)
             .ok_or(TableError::InvalidHandle)?
             .cap;
 
@@ -412,36 +650,43 @@ impl Table {
     }
 
     /// Directly inserts an [OwnedCapability] into this table.
-    pub fn insert_owned(&self, cap: OwnedCapability) -> Result<usize, TableError> {
-        assert_eq!(Arc::as_ptr(&self.post), Arc::as_ptr(&cap.post));
-        Ok(self.insert(cap.inner))
+    ///
+    /// Returns [TableError::PostOfficeMismatch] if the capability has a different [PostOffice].
+    pub fn import_owned(&self, cap: OwnedCapability) -> TableResult<CapabilityHandle> {
+        if Arc::as_ptr(&self.post) != Arc::as_ptr(&cap.post) {
+            return Err(TableError::PostOfficeMismatch);
+        }
+        Ok(CapabilityHandle(self.import(cap.inner).0))
     }
 
-    pub(crate) fn insert(&self, cap: Capability) -> usize {
-        self.inner.lock().insert(cap)
+    /// Helper function to directly insert a [Capability] into this table.
+    pub(crate) fn import(&self, cap: Capability) -> CapabilityHandle {
+        self.inner.lock().import(cap)
     }
 
-    pub(crate) fn map_signal<'a>(&self, signal: Signal<'a>) -> ContextSignal<'a> {
+    /// Imports a table-less [Signal] to a table-local [ContextSignal].
+    pub(crate) fn map_signal<'a>(&self, signal: RouteSignal<'a>) -> TableSignal<'a> {
         match signal {
-            Signal::Unlink { address } => ContextSignal::Unlink {
-                handle: self.insert(Capability {
+            RouteSignal::Down { address } => TableSignal::Down {
+                handle: self.import(Capability {
                     address,
                     perms: Permissions::empty(),
                 }),
             },
-            Signal::Message { data, caps } => ContextSignal::Message {
+            RouteSignal::Message { data, caps } => TableSignal::Message {
                 data,
-                caps: caps.iter().map(|cap| self.insert(*cap)).collect(),
+                caps: caps.iter().map(|cap| self.import(*cap)).collect(),
             },
         }
     }
 
-    pub(crate) fn map_signal_owned(&self, signal: Signal<'_>) -> OwnedContextSignal<'_> {
+    /// Imports a table-less [Signal] to a table-local [OwnedContextSignal].
+    pub(crate) fn map_signal_owned(&self, signal: RouteSignal<'_>) -> OwnedTableSignal<'_> {
         match self.map_signal(signal) {
-            ContextSignal::Unlink { handle } => OwnedContextSignal::Unlink {
+            TableSignal::Down { handle } => OwnedTableSignal::Down {
                 handle: self.wrap_handle(handle).unwrap(),
             },
-            ContextSignal::Message { data, caps } => OwnedContextSignal::Message {
+            TableSignal::Message { data, caps } => OwnedTableSignal::Message {
                 data: data.to_owned(),
                 caps: caps
                     .into_iter()
@@ -452,48 +697,33 @@ impl Table {
     }
 
     /// Tests if a raw capability handle is valid within this table.
-    pub fn is_valid(&self, handle: usize) -> bool {
-        self.inner.lock().entries.contains(handle)
+    pub fn is_valid(&self, handle: CapabilityHandle) -> bool {
+        self.inner.lock().entries.contains(handle.0)
     }
 
-    /// Wraps a raw capability handle in a Rust-friendly [CapabilityHandle] struct.
-    pub fn wrap_handle(&self, handle: usize) -> Result<CapabilityHandle, TableError> {
+    /// Wraps a raw capability handle in a Rust-friendly [CapabilityRef] struct.
+    pub fn wrap_handle(&self, handle: CapabilityHandle) -> TableResult<CapabilityRef> {
         if !self.is_valid(handle) {
             return Err(TableError::InvalidHandle);
         }
 
-        Ok(CapabilityHandle {
+        Ok(CapabilityRef {
             table: self,
             handle,
-        })
-    }
-
-    /// Imports a capability to *any* [Mailbox] into this table.
-    ///
-    /// Panics if the mailbox has a different [PostOffice].
-    pub fn import(&self, mailbox: &Mailbox, perms: Permissions) -> usize {
-        assert_eq!(
-            Arc::as_ptr(&self.post),
-            Arc::as_ptr(&mailbox.store.table.post)
-        );
-
-        self.insert(Capability {
-            address: mailbox.address,
-            perms,
         })
     }
 
     /// Increments the reference count of a capability handle.
     ///
     /// If you'd prefer not to do this manually, try using [Table::wrap_handle]
-    /// and relying on [CapabilityHandle]'s `Clone` implementation instead.
-    pub fn inc_ref(&self, handle: usize) -> Result<(), TableError> {
+    /// and relying on [CapabilityRef]'s `Clone` implementation instead.
+    pub fn inc_ref(&self, handle: CapabilityHandle) -> TableResult<()> {
         self.inner
             .lock()
             .entries
-            .get_mut(handle)
+            .get_mut(handle.0)
             .ok_or(TableError::InvalidHandle)?
-            .refs += 1;
+            .ref_count += 1;
 
         Ok(())
     }
@@ -502,65 +732,113 @@ impl Table {
     /// capability from this table if the reference count hits zero.
     ///
     /// If you'd prefer not to do this manually, try using [Table::wrap_handle]
-    /// and relying on [CapabilityHandle]'s `Drop` implementation instead.
-    pub fn dec_ref(&self, handle: usize) -> Result<(), TableError> {
+    /// and relying on [CapabilityRef]'s `Drop` implementation instead.
+    pub fn dec_ref(&self, handle: CapabilityHandle) -> TableResult<()> {
         let mut inner = self.inner.lock();
 
         let entry = inner
             .entries
-            .get_mut(handle)
+            .get_mut(handle.0)
             .ok_or(TableError::InvalidHandle)?;
 
-        if entry.refs > 1 {
-            entry.refs -= 1;
+        if entry.ref_count > 1 {
+            entry.ref_count -= 1;
         } else {
-            let entry = inner.entries.remove(handle);
+            let entry = inner.entries.remove(handle.0);
             inner.reverse_entries.remove(&entry.cap);
         }
 
         Ok(())
     }
 
-    pub fn get_permissions(&self, handle: usize) -> Result<Permissions, TableError> {
+    /// Retrieves the [Permissions] of a capability handle.
+    pub fn get_permissions(&self, handle: CapabilityHandle) -> TableResult<Permissions> {
         self.inner
             .lock()
             .entries
-            .get(handle)
+            .get(handle.0)
             .ok_or(TableError::InvalidHandle)
             .map(|e| e.cap.perms)
     }
 
-    pub fn demote(&self, handle: usize, perms: Permissions) -> Result<usize, TableError> {
+    /// Creates a new capability from an existing one with a subset of the original's [Permissions].
+    ///
+    /// Returns [TableError::PermissionDenied] if the permissions requested are
+    /// not in the original's.
+    pub fn demote(
+        &self,
+        handle: CapabilityHandle,
+        perms: Permissions,
+    ) -> TableResult<CapabilityHandle> {
         let mut inner = self.inner.lock();
-        let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+        let entry = inner
+            .entries
+            .get(handle.0)
+            .ok_or(TableError::InvalidHandle)?;
         let address = entry.cap.address;
 
         if !entry.cap.perms.contains(perms) {
             return Err(TableError::PermissionDenied);
         }
 
-        let handle = inner.insert(Capability { address, perms });
+        let handle = inner.import(Capability { address, perms });
         Ok(handle)
     }
 
-    pub fn link(&self, handle: usize, mailbox: &Mailbox) -> Result<(), TableError> {
-        assert!(std::ptr::eq(mailbox.store.table, self));
-        let inner = self.inner.lock();
-        let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+    /// Monitors a capability handle with a given mailbox.
+    ///
+    /// When the capability's route is closed, the mailbox will receive a
+    /// down signal ([TableSignal::Down] or [OwnedTableSignal::Down])
+    /// with a capability handle of a demoted version of the monitored
+    /// capability *but with no [Permissions]*.
+    ///
+    /// Returns [TableError::PermissionDenied] if the capability does not have
+    /// [Permissions::MONITOR].
+    ///
+    /// Returns [TableError::TableMismatch] if the mailbox belongs to a different [Table].
+    pub fn monitor(&self, handle: CapabilityHandle, mailbox: &Mailbox) -> TableResult<()> {
+        if !std::ptr::eq(mailbox.group.table, self) {
+            return Err(TableError::TableMismatch);
+        }
 
-        if !entry.cap.perms.contains(Permissions::LINK) {
+        let inner = self.inner.lock();
+        let entry = inner
+            .entries
+            .get(handle.0)
+            .ok_or(TableError::InvalidHandle)?;
+
+        if !entry.cap.perms.contains(Permissions::MONITOR) {
             return Err(TableError::PermissionDenied);
         }
 
-        self.post.link(&entry.cap.address, &mailbox.address);
+        self.post.monitor(&entry.cap.address, &mailbox.address);
         Ok(())
     }
 
-    pub async fn send(&self, handle: usize, data: &[u8], caps: &[usize]) -> Result<(), TableError> {
+    /// Sends a message to the given capability handle.
+    ///
+    /// This function is async because zero-copy sending of signals needs to
+    /// wait for the receiver to finish consuming the sent data before returning
+    /// in order to safely capture the lifetime of the data.
+    ///
+    /// Returns [TableError::PermissionDenied] if the destination capability
+    /// does not have [Permissions::SEND].
+    ///
+    /// Returns [TableError::InvalidHandle] if `handle` or any of `caps` are
+    /// invalid within this table.
+    pub async fn send(
+        &self,
+        handle: CapabilityHandle,
+        data: &[u8],
+        caps: &[CapabilityHandle],
+    ) -> TableResult<()> {
         // move into block to make this future Send
         let (address, mapped_caps) = {
             let inner = self.inner.lock();
-            let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+            let entry = inner
+                .entries
+                .get(handle.0)
+                .ok_or(TableError::InvalidHandle)?;
 
             if !entry.cap.perms.contains(Permissions::SEND) {
                 return Err(TableError::PermissionDenied);
@@ -568,7 +846,7 @@ impl Table {
 
             let mut mapped_caps = Vec::with_capacity(caps.len());
             for cap in caps.iter() {
-                let entry = inner.entries.get(*cap).ok_or(TableError::InvalidHandle)?;
+                let entry = inner.entries.get(cap.0).ok_or(TableError::InvalidHandle)?;
                 mapped_caps.push(entry.cap);
             }
 
@@ -578,7 +856,7 @@ impl Table {
         self.post
             .send(
                 &address,
-                Signal::Message {
+                RouteSignal::Message {
                     data,
                     caps: &mapped_caps,
                 },
@@ -588,9 +866,19 @@ impl Table {
         Ok(())
     }
 
-    pub fn kill(&self, handle: usize) -> Result<(), TableError> {
+    /// Kills a capability handle.
+    ///
+    /// This does NOT decrement the reference count of the handle; only
+    /// attempts to kill it.
+    ///
+    /// Returns [TableError::PermissionDenied] if the given capability does not
+    /// have [Permissions::KILL].
+    pub fn kill(&self, handle: CapabilityHandle) -> TableResult<()> {
         let inner = self.inner.lock();
-        let entry = inner.entries.get(handle).ok_or(TableError::InvalidHandle)?;
+        let entry = inner
+            .entries
+            .get(handle.0)
+            .ok_or(TableError::InvalidHandle)?;
 
         if !entry.cap.perms.contains(Permissions::KILL) {
             return Err(TableError::PermissionDenied);
@@ -605,15 +893,15 @@ impl Table {
 ///
 /// This struct's lifetime is tied to the [Table] that it lives within.
 ///
-/// Cloning and dropping [CapabilityHandle] automatically increments and
+/// Cloning and dropping [CapabilityRef] automatically increments and
 /// decrements the reference count of the handle index, so there's no need to
 /// manually manage capability ownership while using this struct.
-pub struct CapabilityHandle<'a> {
+pub struct CapabilityRef<'a> {
     table: &'a Table,
-    handle: usize,
+    handle: CapabilityHandle,
 }
 
-impl<'a> Clone for CapabilityHandle<'a> {
+impl<'a> Clone for CapabilityRef<'a> {
     fn clone(&self) -> Self {
         self.table.inc_ref(self.handle).unwrap();
 
@@ -624,26 +912,26 @@ impl<'a> Clone for CapabilityHandle<'a> {
     }
 }
 
-impl<'a> Debug for CapabilityHandle<'a> {
+impl<'a> Debug for CapabilityRef<'a> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-        fmt.debug_tuple("CapabilityHandle")
+        fmt.debug_tuple("CapabilityRef")
             .field(&self.handle)
             .finish()
     }
 }
 
-impl<'a> Drop for CapabilityHandle<'a> {
+impl<'a> Drop for CapabilityRef<'a> {
     fn drop(&mut self) {
         self.table.dec_ref(self.handle).unwrap();
     }
 }
 
-impl<'a> CapabilityHandle<'a> {
+impl<'a> CapabilityRef<'a> {
     /// Converts this handle wrapper into a raw handle index.
     ///
     /// You should call [Table::dec_ref] when you're done with this raw handle
     /// to avoid resource leaks.
-    pub fn into_handle(self) -> usize {
+    pub fn into_handle(self) -> CapabilityHandle {
         let handle = self.handle;
         std::mem::forget(self);
         handle
@@ -654,90 +942,139 @@ impl<'a> CapabilityHandle<'a> {
         self.table.get_owned(self.handle).unwrap()
     }
 
+    /// Retrieves the [Permissions] of this capability handle.
     pub fn get_permissions(&self) -> Permissions {
         self.table.get_permissions(self.handle).unwrap()
     }
 
-    pub fn demote(&self, perms: Permissions) -> Result<Self, TableError> {
+    /// Creates a new [CapabilityRef] with a subset of the [Permissions] of this one.
+    ///
+    /// Returns [TableError::PermissionDenied] if the permissions requested are
+    /// not in this one's.
+    pub fn demote(&self, perms: Permissions) -> TableResult<Self> {
         Ok(Self {
             table: self.table,
             handle: self.table.demote(self.handle, perms)?,
         })
     }
 
-    pub fn link(&self, mailbox: &Mailbox<'a>) -> Result<(), TableError> {
-        self.table.link(self.handle, mailbox)
+    /// Monitors this capability handle from a given mailbox.
+    ///
+    /// When this capability's route is closed, the mailbox will receive an
+    /// down signal ([TableSignal::Down] or [OwnedTableSignal::Down])
+    /// with a capability handle of a demoted version of this capability *but
+    /// with no [Permissions]*.
+    ///
+    /// Returns [TableError::PermissionDenied] if this capability does not have
+    /// [Permissions::MONITOR].
+    pub fn monitor(&self, mailbox: &Mailbox<'a>) -> TableResult<()> {
+        self.table.monitor(self.handle, mailbox)
     }
 
-    pub async fn send(
-        &self,
-        data: &[u8],
-        caps: &[&CapabilityHandle<'_>],
-    ) -> Result<(), TableError> {
+    /// Sends a message to this capability handle.
+    ///
+    /// This function is async because zero-copy sending of signals needs to
+    /// wait for the receiver to finish consuming the sent data before returning
+    /// in order to safely capture the lifetime of the data.
+    ///
+    /// Returns [TableError::TableMismatch] if any capabilities have a different [Table].
+    pub async fn send(&self, data: &[u8], caps: &[&CapabilityRef<'_>]) -> TableResult<()> {
         let mut mapped_caps = Vec::with_capacity(caps.len());
         for cap in caps.iter() {
-            assert!(std::ptr::eq(cap.table, self.table));
+            if !std::ptr::eq(cap.table, self.table) {
+                return Err(TableError::TableMismatch);
+            }
             mapped_caps.push(cap.handle);
         }
 
         self.table.send(self.handle, data, &mapped_caps).await
     }
 
-    pub fn kill(&self) -> Result<(), TableError> {
+    /// Kills this capability handle.
+    ///
+    /// Returns [TableError::PermissionDenied] if this capability does not have
+    /// [Permissions::KILL].
+    pub fn kill(&self) -> TableResult<()> {
         self.table.kill(self.handle)
     }
 }
 
-/// A signal received through [Mailbox::recv] or [Mailbox::try_recv].
+/// A signal that has been received through [Mailbox::recv] or
+/// [Mailbox::try_recv] and has been imported into a [Table].
 ///
 /// This enum is non-owning and facilitates zero-copy signal-sending. For
 /// low-level scripting integrations or performance-sensitive signal handling,
 /// this is fine. If you're not doing any of that, you probably want to use
-/// [Mailbox::recv_owned] and [Mailbox::try_recv_owned] with
-/// [OwnedContextSignal] instead.
+/// [Mailbox::recv_owned] and [Mailbox::try_recv_owned] to get an
+/// [OwnedTableSignal] instead.
 ///
 /// Senders of non-owning signals wait for signals to be handled since they own
 /// the signals' memory. Finish dealing with this signal in as quick and as
 /// constant of a time as possible to avoid creating timing attack
 /// vulnerabilities.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ContextSignal<'a> {
-    /// A notification that a capability linked to this mailbox has been killed.
-    ///
-    /// The handle owns a reference to a demoted version of the capability that
-    /// was originally linked with no permission flags.
-    Unlink { handle: usize },
-
-    /// A message from another process.
-    Message { data: &'a [u8], caps: Vec<usize> },
-}
-
-/// An owned signal received through [Mailbox::recv_owned] or [Mailbox::try_recv_owned].
-///
-/// A slower, owning version of [ContextSignal]. The generic lifetime parameter
-/// of this object is tied to the lifetime of the current table and not to the
-/// receiving of the message.
-#[derive(Clone, Debug)]
-pub enum OwnedContextSignal<'a> {
-    /// A notification that a capability linked to this mailbox has been killed.
-    ///
-    /// The handle owns a reference to a demoted version of the capability that
-    /// was originally linked with no permission flags.
-    Unlink { handle: CapabilityHandle<'a> },
+pub enum TableSignal<'a> {
+    /// A notification that a capability monitored by this mailbox has been killed.
+    Down {
+        /// An owning handle of a demoted version of the capability that was
+        /// originally monitored but with no [Permissions].
+        handle: CapabilityHandle,
+    },
 
     /// A message from another process.
     Message {
-        data: Vec<u8>,
-        caps: Vec<CapabilityHandle<'a>>,
+        /// This message's data as a raw byte array.
+        data: &'a [u8],
+
+        /// The capabilities sent in this message.
+        caps: Vec<CapabilityHandle>,
     },
 }
 
-pub struct MailboxStore<'a> {
+/// An owned signal that has been received through [Mailbox::recv_owned] or
+/// [Mailbox::try_recv_owned] and has been imported into a [Table].
+///
+/// A higher-level, owning version of [TableSignal]. The generic lifetime
+/// parameter of this object is tied to the lifetime of the current table and
+/// not to the receiving of the message.
+#[derive(Clone, Debug)]
+pub enum OwnedTableSignal<'a> {
+    /// A notification that a capability monitored by this mailbox has been killed.
+    Down {
+        /// An owning handle of a demoted version of the capability that was
+        /// originally monitored but with no [Permissions].
+        handle: CapabilityRef<'a>,
+    },
+
+    /// A message from another process.
+    Message {
+        /// This message's data as a raw byte array.
+        data: Vec<u8>,
+
+        /// The capabilities sent in this message.
+        caps: Vec<CapabilityRef<'a>>,
+    },
+}
+
+/// A factory for [Mailbox]es that belong to the same route group.
+///
+/// Create a mailbox group for a table using [MailboxGroup::new], then create
+/// mailboxes using [MailboxGroup::create_mailbox]. When the mailboxes from
+/// this group are killed, you cannot create any more mailboxes. You can check
+/// if this mailbox group is still alive without polling mailboxes using
+/// [MailboxGroup::poll_dead].
+///
+/// There is a one-to-many relationship between [Table] and [MailboxGroup], so
+/// create as many groups as you want. However, in most cases where you're only
+/// executing a single process per [Table], you're only going to need a single
+/// group.
+pub struct MailboxGroup<'a> {
     table: &'a Table,
     group: Arc<Mutex<RouteGroup>>,
 }
 
-impl<'a> MailboxStore<'a> {
+impl<'a> MailboxGroup<'a> {
+    /// Creates a new mailbox group for the given [Table].
     pub fn new(table: &'a Table) -> Self {
         Self {
             table,
@@ -748,6 +1085,7 @@ impl<'a> MailboxStore<'a> {
         }
     }
 
+    /// Creates a new mailbox. Returns `None` if this mailbox group has been killed.
     pub fn create_mailbox(&self) -> Option<Mailbox<'_>> {
         let mut group = self.group.lock();
 
@@ -760,76 +1098,80 @@ impl<'a> MailboxStore<'a> {
         group.addresses.insert(address);
 
         Some(Mailbox {
-            store: self,
+            group: self,
             address,
             rx,
         })
     }
+
+    /// Checks if this mailbox group has been killed.
+    pub fn poll_dead(&self) -> bool {
+        self.group.lock().dead
+    }
 }
 
-/// A receiver for [ContextSignals][ContextSignal].
+/// A receiver for [TableSignals][TableSignal].
 ///
 /// Processes create mailboxes in order to receive signals from other processes.
-/// A process can close a mailbox, unlinking it from the other processes, or
-/// a mailbox can be killed by other processes using [Permissions::KILL] on a
-/// mailbox's capability. When a mailbox is killed, all of the other mailboxes
-/// in its [MailboxStore] are killed as well.
+/// A process can close a mailbox or a mailbox can be killed by other processes
+/// using [Permissions::KILL] on a mailbox's capability. When a mailbox is
+/// killed, all of the other mailboxes in its [MailboxGroup] are killed as well.
 ///
 /// To get started using mailboxes, see [Mailbox::recv]. If you don't need to
 /// process zero-copy signals, you can call [Mailbox::recv_owned] instead.
 /// [Mailbox::try_recv] and [Mailbox::try_recv_owned] poll the mailbox for new
 /// signals without blocking.
 pub struct Mailbox<'a> {
-    store: &'a MailboxStore<'a>,
-    address: Address,
-    rx: Receiver<OwnedSignal>,
+    group: &'a MailboxGroup<'a>,
+    address: RouteAddress,
+    rx: Receiver<OwnedRouteSignal>,
 }
 
 impl<'a> Drop for Mailbox<'a> {
     fn drop(&mut self) {
-        self.store.table.post.close(&self.address);
+        self.group.table.post.close(&self.address);
     }
 }
 
 impl<'a> Mailbox<'a> {
     /// Receives a single signal from this mailbox.
     ///
-    /// [ContextSignal] is non-owning, so this function takes a closure to map
-    /// a temporary [ContextSignal] into types of a larger lifetime.
+    /// [TableSignal] is non-owning, so this function takes a closure to map a
+    /// temporary [TableSignal] into types of a larger lifetime.
     ///
     /// Returns `None` when this mailbox's process has been killed.
-    pub async fn recv<T>(&self, mut f: impl FnMut(ContextSignal) -> T) -> Option<T> {
+    pub async fn recv<T>(&self, mut f: impl FnMut(TableSignal) -> T) -> Option<T> {
         self.rx
             .recv(|signal| {
-                let signal = self.store.table.map_signal(signal);
+                let signal = self.group.table.map_signal(signal);
                 f(signal)
             })
             .await
             .ok()
     }
 
-    /// Receives a [OwnedContextSignal].
+    /// Receives a [OwnedTableSignal].
     ///
     /// Returns `None` when this mailbox's process has been killed.
-    pub async fn recv_owned(&self) -> Option<OwnedContextSignal<'a>> {
+    pub async fn recv_owned(&self) -> Option<OwnedTableSignal<'a>> {
         self.rx
-            .recv(|signal| self.store.table.map_signal_owned(signal))
+            .recv(|signal| self.group.table.map_signal_owned(signal))
             .await
             .ok()
     }
 
     /// Polls this mailbox for any currently available signals.
     ///
-    /// [ContextSignal] is non-owning, so this function takes a lambda to map
-    /// a temporary [ContextSignal] into types of a larger lifetime.
+    /// [TableSignal] is non-owning, so this function takes a lambda to map
+    /// a temporary [TableSignal] into types of a larger lifetime.
     ///
     /// Returns:
     /// - `Some(Some(t))` when there was a signal available and it was mapped by the lambda.
     /// - `Some(None)` when there was not a signal available.
     /// - `None` when this mailbox's process has been killed.
-    pub fn try_recv<T>(&self, mut f: impl FnMut(ContextSignal) -> T) -> Option<Option<T>> {
+    pub fn try_recv<T>(&self, mut f: impl FnMut(TableSignal) -> T) -> Option<Option<T>> {
         let result = self.rx.try_recv(|signal| {
-            let signal = self.store.table.map_signal(signal);
+            let signal = self.group.table.map_signal(signal);
             f(signal)
         });
 
@@ -846,10 +1188,10 @@ impl<'a> Mailbox<'a> {
     /// - `Some(Some(t))` when there was a signal available.
     /// - `Some(None)` when there was not a signal available.
     /// - `None` when this mailbox's process has been killed.
-    pub fn try_recv_owned(&self) -> Option<Option<OwnedContextSignal<'a>>> {
+    pub fn try_recv_owned(&self) -> Option<Option<OwnedTableSignal<'a>>> {
         let result = self
             .rx
-            .try_recv(|signal| self.store.table.map_signal_owned(signal));
+            .try_recv(|signal| self.group.table.map_signal_owned(signal));
 
         match result {
             Ok(signal) => Some(Some(signal)),
@@ -858,277 +1200,29 @@ impl<'a> Mailbox<'a> {
         }
     }
 
-    /// Creates a capability within this mailbox's parent table to this mailbox's route.
-    pub fn make_capability(&self, perms: Permissions) -> CapabilityHandle<'a> {
-        let handle = self.store.table.insert(Capability {
+    /// Exports a [CapabilityRef] to a [Table]
+    pub fn export(&self, perms: Permissions, table: &'a Table) -> TableResult<CapabilityRef<'a>> {
+        if !Arc::ptr_eq(&self.group.table.post, &table.post) {
+            return Err(TableError::PostOfficeMismatch);
+        }
+        let handle = table.import(Capability {
             address: self.address,
             perms,
         });
 
-        CapabilityHandle {
-            table: self.store.table,
-            handle,
+        Ok(CapabilityRef { table, handle })
+    }
+
+    /// Exports an [OwnedCapability] from this mailbox.
+    ///
+    /// This method is intended to be used to import a capability from a mailbox into a [Table].
+    pub fn export_owned(&self, perms: Permissions) -> OwnedCapability {
+        OwnedCapability {
+            inner: Capability {
+                address: self.address,
+                perms,
+            },
+            post: self.group.table.post.clone(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn send_message() {
-        let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_capability(Permissions::SEND);
-        ad.send(b"Hello world!", &[]).await.unwrap();
-
-        assert!(mb
-            .recv(|s| {
-                s == ContextSignal::Message {
-                    data: b"Hello world!",
-                    caps: vec![],
-                }
-            })
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn send_address() {
-        let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_capability(Permissions::SEND);
-        ad.send(b"", &[&ad]).await.unwrap();
-
-        assert!(mb
-            .recv(move |s| {
-                s == ContextSignal::Message {
-                    data: b"",
-                    caps: vec![ad.handle],
-                }
-            })
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn table_send_impls_send() {
-        let table = Table::default();
-
-        tokio::spawn(async move {
-            let mb_store = MailboxStore::new(&table);
-            let mb = mb_store.create_mailbox().unwrap();
-            let ad = mb.make_capability(Permissions::SEND);
-            ad.send(b"Hello world!", &[]).await.unwrap();
-
-            assert!(mb
-                .recv(|s| {
-                    s == ContextSignal::Message {
-                        data: b"Hello world!",
-                        caps: vec![],
-                    }
-                })
-                .await
-                .unwrap());
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn try_recv() {
-        let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
-
-        assert_eq!(mb.try_recv(|_| ()), Some(None));
-
-        let ad = mb.make_capability(Permissions::SEND);
-        ad.send(b"Hello world!", &[]).await.unwrap();
-
-        assert!(mb
-            .try_recv(|s| {
-                s == ContextSignal::Message {
-                    data: b"Hello world!",
-                    caps: vec![],
-                }
-            })
-            .unwrap()
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn deny_send() {
-        let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_capability(Permissions::empty());
-        let result = ad.send(b"", &[]).await;
-        assert_eq!(result, Err(TableError::PermissionDenied));
-    }
-
-    #[tokio::test]
-    async fn deny_kill() {
-        let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_capability(Permissions::empty());
-        let result = ad.kill();
-        assert_eq!(result, Err(TableError::PermissionDenied));
-    }
-
-    #[tokio::test]
-    async fn deny_link() {
-        let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_capability(Permissions::empty());
-        let result = ad.link(&mb);
-        assert_eq!(result, Err(TableError::PermissionDenied));
-    }
-
-    #[tokio::test]
-    async fn deny_demote_escalation() {
-        let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_capability(Permissions::KILL);
-        let result = ad.demote(Permissions::SEND);
-        assert_eq!(result.unwrap_err(), TableError::PermissionDenied);
-    }
-
-    #[tokio::test]
-    async fn kill() {
-        let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_capability(Permissions::KILL);
-        ad.kill().unwrap();
-        assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
-    }
-
-    #[tokio::test]
-    async fn double_kill() {
-        let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_capability(Permissions::KILL);
-        ad.kill().unwrap();
-        ad.kill().unwrap();
-        assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
-    }
-
-    #[tokio::test]
-    async fn dropped_handles_are_freed() {
-        let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb = mb_store.create_mailbox().unwrap();
-        let ad = mb.make_capability(Permissions::empty());
-        let handle = ad.handle;
-        assert!(table.is_valid(handle));
-        drop(ad);
-        assert!(!table.is_valid(handle));
-    }
-
-    #[tokio::test]
-    async fn kill_all_mailboxes() {
-        let table = Table::default();
-        let mb_store = MailboxStore::new(&table);
-        let mb1 = mb_store.create_mailbox().unwrap();
-        let mb2 = mb_store.create_mailbox().unwrap();
-        let ad = mb1.make_capability(Permissions::KILL);
-        ad.kill().unwrap();
-        assert_eq!(mb2.recv(|s| format!("{:?}", s)).await, None);
-    }
-
-    #[tokio::test]
-    async fn unlink_on_kill() {
-        let table = Table::default();
-        let o_store = MailboxStore::new(&table);
-        let object = o_store.create_mailbox().unwrap();
-
-        let child = table.spawn();
-        let s_store = MailboxStore::new(&child);
-        let s_mb = s_store.create_mailbox().unwrap();
-
-        let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
-
-        let s_cap = CapabilityHandle {
-            table: &table,
-            handle: s_handle,
-        };
-
-        s_cap.link(&object).unwrap();
-        s_cap.kill().unwrap();
-
-        let expected = ContextSignal::Unlink {
-            handle: s_cap.demote(Permissions::empty()).unwrap().handle,
-        };
-
-        object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn unlink_on_close() {
-        let table = Table::default();
-        let store = MailboxStore::new(&table);
-        let s_mb = store.create_mailbox().unwrap();
-        let s_cap = s_mb.make_capability(Permissions::LINK);
-        let object = store.create_mailbox().unwrap();
-        s_cap.link(&object).unwrap();
-        drop(s_mb);
-
-        let expected = ContextSignal::Unlink {
-            handle: s_cap.demote(Permissions::empty()).unwrap().handle,
-        };
-
-        object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn unlink_dead() {
-        let table = Table::default();
-        let o_store = MailboxStore::new(&table);
-        let object = o_store.create_mailbox().unwrap();
-
-        let child = table.spawn();
-        let s_store = MailboxStore::new(&child);
-        let s_mb = s_store.create_mailbox().unwrap();
-
-        let s_handle = table.import(&s_mb, Permissions::LINK | Permissions::KILL);
-
-        let s_cap = CapabilityHandle {
-            table: &table,
-            handle: s_handle,
-        };
-
-        s_cap.kill().unwrap();
-        s_cap.link(&object).unwrap();
-
-        let expected = ContextSignal::Unlink {
-            handle: s_cap.demote(Permissions::empty()).unwrap().handle,
-        };
-
-        object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn unlink_closed() {
-        let table = Table::default();
-        let store = MailboxStore::new(&table);
-        let s_mb = store.create_mailbox().unwrap();
-        let s_cap = s_mb.make_capability(Permissions::LINK);
-        let object = store.create_mailbox().unwrap();
-        drop(s_mb);
-        s_cap.link(&object).unwrap();
-
-        let expected = ContextSignal::Unlink {
-            handle: s_cap.demote(Permissions::empty()).unwrap().handle,
-        };
-
-        object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
     }
 }

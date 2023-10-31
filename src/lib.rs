@@ -204,25 +204,41 @@ impl OwningMessage for OwnedRouteSignal {
     }
 }
 
-/// Shared state for a group of routes that are all killed when any of them
-/// are killed.
-struct RouteGroup {
+/// Protected, mutable route group state that can only be accessed by the
+/// methods on [RouteGroup].
+#[derive(Default)]
+struct RouteGroupInner {
     addresses: HashSet<RouteAddress>,
     dead: bool,
 }
 
+/// Shared state for a group of routes that are all killed when any of them
+/// are killed.
+#[derive(Default)]
+pub struct RouteGroup {
+    /// A protected mutex containing this route group's mutable data.
+    inner: Mutex<RouteGroupInner>,
+}
+
 impl RouteGroup {
     /// Kills this route group exactly once.
-    pub fn kill(&mut self, post: &Arc<PostOffice>) {
-        if self.dead {
+    pub fn kill(&self, post: &Arc<PostOffice>) {
+        let mut inner = self.inner.lock();
+
+        if inner.dead {
             return;
         }
 
-        self.dead = true;
+        inner.dead = true;
 
-        for address in self.addresses.iter() {
+        for address in inner.addresses.iter() {
             post.close(address);
         }
+    }
+
+    /// Gets if this route group is dead.
+    pub fn is_dead(&self) -> bool {
+        self.inner.lock().dead
     }
 }
 
@@ -232,7 +248,7 @@ struct Route {
     tx: Option<Sender<OwnedRouteSignal>>,
 
     /// The [RouteGroup] that this route is a member of.
-    group: Option<Arc<Mutex<RouteGroup>>>,
+    group: Option<Arc<RouteGroup>>,
 
     /// A set of other routes that are monitoring this route.
     ///
@@ -312,20 +328,44 @@ impl PostOffice {
         })
     }
 
-    /// Inserts a new route into this post office and returns its new [RouteAddress].
+    /// Inserts a new route in the given route group into this post office and
+    /// returns its new [RouteAddress].
+    ///
+    /// Returns `None` if the route group is dead.
     pub(crate) fn insert(
         &self,
         tx: Sender<OwnedRouteSignal>,
-        group: Arc<Mutex<RouteGroup>>,
-    ) -> RouteAddress {
+        group: Arc<RouteGroup>,
+    ) -> Option<RouteAddress> {
+        // lock the route group so we can mutate it
+        let mut group_inner = group.inner.lock();
+
+        // immediately abort if the group is dead
+        if group_inner.dead {
+            return None;
+        }
+
+        // create a new route
         let mut route = self.routes.create().unwrap();
+
+        // get the new route's address
+        let address = RouteAddress {
+            handle: RouteHandle(route.key()),
+            generation: route.generation,
+        };
+
+        // add the address to the route group
+        group_inner.addresses.insert(address);
+
+        // unlock the mutex so we can move the group into the route entry
+        drop(group_inner);
+
+        // initialize the route entry
         route.tx = Some(tx);
         route.group = Some(group);
 
-        RouteAddress {
-            handle: RouteHandle(route.key()),
-            generation: route.generation,
-        }
+        // return the new address
+        Some(address)
     }
 
     /// Kills this route's route group.
@@ -337,7 +377,7 @@ impl PostOffice {
             return;
         };
 
-        route.group.as_ref().unwrap().lock().kill(self);
+        route.group.as_ref().unwrap().kill(self);
     }
 
     /// Closes a route, frees its entry, and sends down signals to all routes
@@ -1070,7 +1110,7 @@ pub enum OwnedTableSignal<'a> {
 /// group.
 pub struct MailboxGroup<'a> {
     table: &'a Table,
-    group: Arc<Mutex<RouteGroup>>,
+    group: Arc<RouteGroup>,
 }
 
 impl<'a> MailboxGroup<'a> {
@@ -1078,24 +1118,14 @@ impl<'a> MailboxGroup<'a> {
     pub fn new(table: &'a Table) -> Self {
         Self {
             table,
-            group: Arc::new(Mutex::new(RouteGroup {
-                addresses: HashSet::new(),
-                dead: false,
-            })),
+            group: Arc::new(RouteGroup::default()),
         }
     }
 
     /// Creates a new mailbox. Returns `None` if this mailbox group has been killed.
     pub fn create_mailbox(&self) -> Option<Mailbox<'_>> {
-        let mut group = self.group.lock();
-
-        if group.dead {
-            return None;
-        }
-
         let (tx, rx) = channel();
-        let address = self.table.post.insert(tx, self.group.clone());
-        group.addresses.insert(address);
+        let address = self.table.post.insert(tx, self.group.clone())?;
 
         Some(Mailbox {
             group: self,
@@ -1104,9 +1134,14 @@ impl<'a> MailboxGroup<'a> {
         })
     }
 
+    /// Retrieves this mailbox group's underlying route group.
+    pub fn get_route_group(&self) -> &Arc<RouteGroup> {
+        &self.group
+    }
+
     /// Checks if this mailbox group has been killed.
     pub fn poll_dead(&self) -> bool {
-        self.group.lock().dead
+        self.group.is_dead()
     }
 }
 

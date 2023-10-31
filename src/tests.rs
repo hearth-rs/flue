@@ -296,6 +296,47 @@ async fn down_closed() {
 }
 
 #[tokio::test]
+async fn link() {
+    let a_table = Table::default();
+    let a_group = MailboxGroup::new(&a_table);
+    let a_mb = a_group.create_mailbox().unwrap();
+
+    let b_table = a_table.spawn();
+    let b_group = MailboxGroup::new(&b_table);
+
+    let a_handle = b_table
+        .import_owned(a_mb.export_owned(Permissions::LINK))
+        .unwrap();
+
+    b_table.link(a_handle, &b_group).unwrap();
+
+    a_group.kill();
+    yield_now().await; // flush pending link kills
+    assert!(b_group.poll_dead());
+}
+
+#[tokio::test]
+async fn unlink() {
+    let a_table = Table::default();
+    let a_group = MailboxGroup::new(&a_table);
+    let a_mb = a_group.create_mailbox().unwrap();
+
+    let b_table = a_table.spawn();
+    let b_group = MailboxGroup::new(&b_table);
+
+    let a_handle = b_table
+        .import_owned(a_mb.export_owned(Permissions::LINK))
+        .unwrap();
+
+    b_table.link(a_handle, &b_group).unwrap();
+    b_table.unlink(a_handle, &b_group).unwrap();
+
+    a_group.kill();
+    yield_now().await; // flush pending link kills
+    assert!(!b_group.poll_dead());
+}
+
+#[tokio::test]
 async fn link_groups() {
     let post = PostOffice::new();
     let a = Arc::new(RouteGroup::default());

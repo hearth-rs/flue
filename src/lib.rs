@@ -148,6 +148,10 @@ bitflags::bitflags! {
 
         /// The permission to kill this capability.
         const KILL = 1 << 2;
+
+        /// The permission to link to this capability, comprised of both the
+        /// [Self::MONITOR] and [Self::KILL] permissions.
+        const LINK = (1 << 1) | (1 << 0);
     }
 }
 
@@ -560,6 +564,24 @@ impl PostOffice {
         monitors.insert(*object);
     }
 
+    /// Links the route group of a given route to a route group.
+    pub(crate) fn link(self: &Arc<Self>, route: &RouteAddress, group: &Arc<RouteGroup>) {
+        let Some(route) = self.get_route(route) else {
+            return;
+        };
+
+        RouteGroup::link(self, route.group.as_ref().unwrap(), group);
+    }
+
+    /// Unlinks the route group of a given route from a route group.
+    pub(crate) fn unlink(self: &Arc<Self>, route: &RouteAddress, group: &Arc<RouteGroup>) {
+        let Some(route) = self.get_route(route) else {
+            return;
+        };
+
+        RouteGroup::unlink(route.group.as_ref().unwrap(), group);
+    }
+
     /// Internal helper function to look up a route by address (including generation).
     fn get_route(&self, address: &RouteAddress) -> Option<impl Deref<Target = Route> + '_> {
         let route = self.routes.get(address.handle.0)?;
@@ -930,6 +952,71 @@ impl Table {
         Ok(())
     }
 
+    /// Links a mailbox group to the given capability.
+    ///
+    /// When the capability's route group dies, the given mailbox group will
+    /// also be killed. Linking works the other way, too: when the mailbox
+    /// group dies, the capability will also be killed.
+    ///
+    /// If either the mailbox group or the given capability are already dead,
+    /// the other will be killed.
+    ///
+    /// Returns [TableError::PermissionDenied] if the capability does not have
+    /// [Permissions::LINK].
+    ///
+    /// Returns [TableError::TableMismatch] if the mailbox group is using
+    /// a different [Table].
+    ///
+    /// Does nothing if the capability and mailbox group are already linked.
+    pub fn link(&self, handle: CapabilityHandle, group: &MailboxGroup) -> TableResult<()> {
+        if !std::ptr::eq(group.table, self) {
+            return Err(TableError::TableMismatch);
+        }
+
+        let inner = self.inner.lock();
+        let entry = inner
+            .entries
+            .get(handle.0)
+            .ok_or(TableError::InvalidHandle)?;
+
+        if !entry.cap.perms.contains(Permissions::LINK) {
+            return Err(TableError::PermissionDenied);
+        }
+
+        self.post.link(&entry.cap.address, &group.group);
+        Ok(())
+    }
+
+    /// Unlinks a mailbox group from the given capability.
+    ///
+    /// Undoes [Self::link].
+    ///
+    /// Returns [TableError::PermissionDenied] if the capability does not have
+    /// [Permissions::LINK].
+    ///
+    /// Returns [TableError::TableMismatch] if the mailbox group is using
+    /// a different [Table].
+    ///
+    /// Does nothing if the capability and mailbox group are already unlinked.
+    pub fn unlink(&self, handle: CapabilityHandle, group: &MailboxGroup) -> TableResult<()> {
+        if !std::ptr::eq(group.table, self) {
+            return Err(TableError::TableMismatch);
+        }
+
+        let inner = self.inner.lock();
+        let entry = inner
+            .entries
+            .get(handle.0)
+            .ok_or(TableError::InvalidHandle)?;
+
+        if !entry.cap.perms.contains(Permissions::LINK) {
+            return Err(TableError::PermissionDenied);
+        }
+
+        self.post.unlink(&entry.cap.address, &group.group);
+        Ok(())
+    }
+
     /// Sends a message to the given capability handle.
     ///
     /// This function is async because zero-copy sending of signals needs to
@@ -1212,6 +1299,11 @@ impl<'a> MailboxGroup<'a> {
     /// Retrieves this mailbox group's underlying route group.
     pub fn get_route_group(&self) -> &Arc<RouteGroup> {
         &self.group
+    }
+
+    /// Kills this mailbox group.
+    pub fn kill(&self) {
+        self.group.kill(&self.table.post);
     }
 
     /// Checks if this mailbox group has been killed.

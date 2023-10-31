@@ -51,6 +51,12 @@
 //!    killed, the mailbox receives a "down" signal with a permission-less
 //!    capability to the monitored route. If the route is already closed at the
 //!    time of monitoring, the mailbox will immediately receive the down signal.
+//! 4. **Link**: Links a given route group to the capability's route group.
+//!    When either route group dies, the other will also be killed. If either
+//!    group is already dead, the other will be immediately killed. A link can
+//!    be removed at any time by **unlinking** the two route groups. Unlike
+//!    monitoring, a link between two route groups persists even if the linked
+//!    capability's route is closed.
 //!
 //! A capability may also be "demoted" to a new capability that refers to the
 //! same route but with a subset of the original's permissions. This can be

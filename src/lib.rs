@@ -210,6 +210,39 @@ impl OwningMessage for OwnedRouteSignal {
 struct RouteGroupInner {
     addresses: HashSet<RouteAddress>,
     dead: bool,
+    links: Vec<Arc<RouteGroup>>,
+}
+
+impl RouteGroupInner {
+    /// Kills this route group exactly once.
+    fn kill(&mut self, post: &Arc<PostOffice>) {
+        if self.dead {
+            return;
+        }
+
+        self.dead = true;
+
+        // close all of this group's routes
+        for address in self.addresses.iter() {
+            post.close(address);
+        }
+
+        // kill links asynchronously in order to return in constant time
+        // mitigates timing attacks and eliminates delays
+        // also avoids deadlocks when a linked process tries to lock this process to kill it
+        tokio::spawn({
+            // move owned values into the task
+            // take links to avoid cyclic route group references
+            let links = std::mem::take(&mut self.links);
+            let post = post.clone();
+
+            async move {
+                for link in links {
+                    link.kill(&post);
+                }
+            }
+        });
+    }
 }
 
 /// Shared state for a group of routes that are all killed when any of them
@@ -223,22 +256,61 @@ pub struct RouteGroup {
 impl RouteGroup {
     /// Kills this route group exactly once.
     pub fn kill(&self, post: &Arc<PostOffice>) {
-        let mut inner = self.inner.lock();
-
-        if inner.dead {
-            return;
-        }
-
-        inner.dead = true;
-
-        for address in inner.addresses.iter() {
-            post.close(address);
-        }
+        self.inner.lock().kill(post);
     }
 
     /// Gets if this route group is dead.
     pub fn is_dead(&self) -> bool {
         self.inner.lock().dead
+    }
+
+    /// Links two route groups together.
+    ///
+    /// Kills the other if either one is already dead.
+    ///
+    /// Does nothing if the same route group is linked against itself.
+    pub fn link(post: &Arc<PostOffice>, a: &Arc<Self>, b: &Arc<Self>) {
+        // check that the groups are not the same
+        if Arc::ptr_eq(a, b) {
+            return;
+        }
+
+        // lock both groups simultaneously
+        let mut a_inner = a.inner.lock();
+        let mut b_inner = b.inner.lock();
+
+        // kill the other if either is dead while keeping the locks
+        if a_inner.dead != b_inner.dead {
+            if a_inner.dead {
+                b_inner.kill(post);
+            } else {
+                a_inner.kill(post);
+            }
+
+            return;
+        }
+
+        // add each other to their link lists
+        a_inner.links.push(b.clone());
+        b_inner.links.push(a.clone());
+    }
+
+    /// Unlinks two linked route groups.
+    ///
+    /// Does nothing if the two groups are not linked.
+    pub fn unlink(a: &Arc<Self>, b: &Arc<Self>) {
+        // lock both groups simultaneously
+        let mut a_inner = a.inner.lock();
+        let mut b_inner = b.inner.lock();
+
+        // early exit if either is dead
+        if a_inner.dead || b_inner.dead {
+            return;
+        }
+
+        // remove each other's references
+        a_inner.links.retain(|link| !Arc::ptr_eq(link, b));
+        b_inner.links.retain(|link| !Arc::ptr_eq(link, a));
     }
 }
 
@@ -391,14 +463,17 @@ impl PostOffice {
             return;
         };
 
-        let address = *address;
-        let post = self.to_owned();
-
         // send down signals asynchronously in order to return in constant time
         // mitigates timing attacks and eliminates delays
-        tokio::spawn(async move {
-            for monitor in monitors {
-                post.send(&monitor, RouteSignal::Down { address }).await;
+        tokio::spawn({
+            // move owned values into the task
+            let address = *address;
+            let post = self.to_owned();
+
+            async move {
+                for monitor in monitors {
+                    post.send(&monitor, RouteSignal::Down { address }).await;
+                }
             }
         });
 

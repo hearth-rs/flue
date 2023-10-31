@@ -17,6 +17,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with Flue. If not, see <https://www.gnu.org/licenses/>.
 
+use tokio::task::yield_now;
+
 use super::*;
 
 #[tokio::test]
@@ -291,6 +293,48 @@ async fn down_closed() {
     };
 
     object.recv(move |s| assert_eq!(s, expected)).await.unwrap();
+}
+
+#[tokio::test]
+async fn link_groups() {
+    let post = PostOffice::new();
+    let a = Arc::new(RouteGroup::default());
+    let b = Arc::new(RouteGroup::default());
+
+    RouteGroup::link(&post, &a, &b);
+
+    a.kill(&post);
+    yield_now().await; // flush pending link kills
+    assert!(b.is_dead());
+}
+
+#[tokio::test]
+async fn link_group_chain() {
+    let post = PostOffice::new();
+    let a = Arc::new(RouteGroup::default());
+    let b = Arc::new(RouteGroup::default());
+    let c = Arc::new(RouteGroup::default());
+
+    RouteGroup::link(&post, &a, &b);
+    RouteGroup::link(&post, &b, &c);
+
+    a.kill(&post);
+    yield_now().await; // flush pending link kills
+    assert!(c.is_dead());
+}
+
+#[tokio::test]
+async fn unlink_groups() {
+    let post = PostOffice::new();
+    let a = Arc::new(RouteGroup::default());
+    let b = Arc::new(RouteGroup::default());
+
+    RouteGroup::link(&post, &a, &b);
+    RouteGroup::unlink(&a, &b);
+
+    a.kill(&post);
+    yield_now().await; // flush pending link kills
+    assert!(!b.is_dead());
 }
 
 impl OwningMessage for String {

@@ -1201,10 +1201,15 @@ impl<'a> Mailbox<'a> {
     }
 
     /// Exports a [CapabilityRef] to a [Table]
-    pub fn export(&self, perms: Permissions, table: &'a Table) -> TableResult<CapabilityRef<'a>> {
+    pub fn export<'b>(
+        &self,
+        perms: Permissions,
+        table: &'b Table,
+    ) -> TableResult<CapabilityRef<'b>> {
         if !Arc::ptr_eq(&self.group.table.post, &table.post) {
             return Err(TableError::PostOfficeMismatch);
         }
+
         let handle = table.import(Capability {
             address: self.address,
             perms,

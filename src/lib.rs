@@ -1140,7 +1140,7 @@ impl<'a> Mailbox<'a> {
     /// temporary [TableSignal] into types of a larger lifetime.
     ///
     /// Returns `None` when this mailbox's process has been killed.
-    pub async fn recv<T>(&self, mut f: impl FnMut(TableSignal) -> T) -> Option<T> {
+    pub async fn recv<T>(&self, mut f: impl for<'b> FnMut(TableSignal<'b>) -> T) -> Option<T> {
         self.rx
             .recv(|signal| {
                 let signal = self.group.table.map_signal(signal);
@@ -1169,7 +1169,10 @@ impl<'a> Mailbox<'a> {
     /// - `Some(Some(t))` when there was a signal available and it was mapped by the lambda.
     /// - `Some(None)` when there was not a signal available.
     /// - `None` when this mailbox's process has been killed.
-    pub fn try_recv<T>(&self, mut f: impl FnMut(TableSignal) -> T) -> Option<Option<T>> {
+    pub fn try_recv<T>(
+        &self,
+        mut f: impl for<'b> FnMut(TableSignal<'b>) -> T,
+    ) -> Option<Option<T>> {
         let result = self.rx.try_recv(|signal| {
             let signal = self.group.table.map_signal(signal);
             f(signal)

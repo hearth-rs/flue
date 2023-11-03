@@ -26,7 +26,7 @@ async fn send_message() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.export_to(Permissions::SEND, &table).unwrap();
+    let ad = mb.export(Permissions::SEND).unwrap();
     ad.send(b"Hello world!", &[]).await.unwrap();
 
     assert!(mb

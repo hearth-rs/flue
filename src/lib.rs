@@ -51,6 +51,12 @@
 //!    killed, the mailbox receives a "down" signal with a permission-less
 //!    capability to the monitored route. If the route is already closed at the
 //!    time of monitoring, the mailbox will immediately receive the down signal.
+//! 4. **Link**: Links a given route group to the capability's route group.
+//!    When either route group dies, the other will also be killed. If either
+//!    group is already dead, the other will be immediately killed. A link can
+//!    be removed at any time by **unlinking** the two route groups. Unlike
+//!    monitoring, a link between two route groups persists even if the linked
+//!    capability's route is closed.
 //!
 //! A capability may also be "demoted" to a new capability that refers to the
 //! same route but with a subset of the original's permissions. This can be
@@ -148,6 +154,10 @@ bitflags::bitflags! {
 
         /// The permission to kill this capability.
         const KILL = 1 << 2;
+
+        /// The permission to link to this capability, comprised of both the
+        /// [Self::MONITOR] and [Self::KILL] permissions.
+        const LINK = (1 << 1) | (1 << 0);
     }
 }
 
@@ -204,25 +214,113 @@ impl OwningMessage for OwnedRouteSignal {
     }
 }
 
-/// Shared state for a group of routes that are all killed when any of them
-/// are killed.
-struct RouteGroup {
+/// Protected, mutable route group state that can only be accessed by the
+/// methods on [RouteGroup].
+#[derive(Default)]
+struct RouteGroupInner {
     addresses: HashSet<RouteAddress>,
     dead: bool,
+    links: Vec<Arc<RouteGroup>>,
 }
 
-impl RouteGroup {
+impl RouteGroupInner {
     /// Kills this route group exactly once.
-    pub fn kill(&mut self, post: &Arc<PostOffice>) {
+    fn kill(&mut self, post: &Arc<PostOffice>) {
         if self.dead {
             return;
         }
 
         self.dead = true;
 
+        // close all of this group's routes
         for address in self.addresses.iter() {
             post.close(address);
         }
+
+        // kill links asynchronously in order to return in constant time
+        // mitigates timing attacks and eliminates delays
+        // also avoids deadlocks when a linked process tries to lock this process to kill it
+        tokio::spawn({
+            // move owned values into the task
+            // take links to avoid cyclic route group references
+            let links = std::mem::take(&mut self.links);
+            let post = post.clone();
+
+            async move {
+                for link in links {
+                    link.kill(&post);
+                }
+            }
+        });
+    }
+}
+
+/// Shared state for a group of routes that are all killed when any of them
+/// are killed.
+#[derive(Default)]
+pub struct RouteGroup {
+    /// A protected mutex containing this route group's mutable data.
+    inner: Mutex<RouteGroupInner>,
+}
+
+impl RouteGroup {
+    /// Kills this route group exactly once.
+    pub fn kill(&self, post: &Arc<PostOffice>) {
+        self.inner.lock().kill(post);
+    }
+
+    /// Gets if this route group is dead.
+    pub fn is_dead(&self) -> bool {
+        self.inner.lock().dead
+    }
+
+    /// Links two route groups together.
+    ///
+    /// Kills the other if either one is already dead.
+    ///
+    /// Does nothing if the same route group is linked against itself.
+    pub fn link(post: &Arc<PostOffice>, a: &Arc<Self>, b: &Arc<Self>) {
+        // check that the groups are not the same
+        if Arc::ptr_eq(a, b) {
+            return;
+        }
+
+        // lock both groups simultaneously
+        let mut a_inner = a.inner.lock();
+        let mut b_inner = b.inner.lock();
+
+        // kill the other if either is dead while keeping the locks
+        if a_inner.dead != b_inner.dead {
+            if a_inner.dead {
+                b_inner.kill(post);
+            } else {
+                a_inner.kill(post);
+            }
+
+            return;
+        }
+
+        // add each other to their link lists
+        a_inner.links.push(b.clone());
+        b_inner.links.push(a.clone());
+    }
+
+    /// Unlinks two linked route groups.
+    ///
+    /// Does nothing if the two groups are not linked.
+    pub fn unlink(a: &Arc<Self>, b: &Arc<Self>) {
+        // lock both groups simultaneously
+        let mut a_inner = a.inner.lock();
+        let mut b_inner = b.inner.lock();
+
+        // early exit if either is dead
+        if a_inner.dead || b_inner.dead {
+            return;
+        }
+
+        // remove each other's references
+        a_inner.links.retain(|link| !Arc::ptr_eq(link, b));
+        b_inner.links.retain(|link| !Arc::ptr_eq(link, a));
     }
 }
 
@@ -232,7 +330,7 @@ struct Route {
     tx: Option<Sender<OwnedRouteSignal>>,
 
     /// The [RouteGroup] that this route is a member of.
-    group: Option<Arc<Mutex<RouteGroup>>>,
+    group: Option<Arc<RouteGroup>>,
 
     /// A set of other routes that are monitoring this route.
     ///
@@ -312,20 +410,44 @@ impl PostOffice {
         })
     }
 
-    /// Inserts a new route into this post office and returns its new [RouteAddress].
+    /// Inserts a new route in the given route group into this post office and
+    /// returns its new [RouteAddress].
+    ///
+    /// Returns `None` if the route group is dead.
     pub(crate) fn insert(
         &self,
         tx: Sender<OwnedRouteSignal>,
-        group: Arc<Mutex<RouteGroup>>,
-    ) -> RouteAddress {
+        group: Arc<RouteGroup>,
+    ) -> Option<RouteAddress> {
+        // lock the route group so we can mutate it
+        let mut group_inner = group.inner.lock();
+
+        // immediately abort if the group is dead
+        if group_inner.dead {
+            return None;
+        }
+
+        // create a new route
         let mut route = self.routes.create().unwrap();
+
+        // get the new route's address
+        let address = RouteAddress {
+            handle: RouteHandle(route.key()),
+            generation: route.generation,
+        };
+
+        // add the address to the route group
+        group_inner.addresses.insert(address);
+
+        // unlock the mutex so we can move the group into the route entry
+        drop(group_inner);
+
+        // initialize the route entry
         route.tx = Some(tx);
         route.group = Some(group);
 
-        RouteAddress {
-            handle: RouteHandle(route.key()),
-            generation: route.generation,
-        }
+        // return the new address
+        Some(address)
     }
 
     /// Kills this route's route group.
@@ -337,7 +459,7 @@ impl PostOffice {
             return;
         };
 
-        route.group.as_ref().unwrap().lock().kill(self);
+        route.group.as_ref().unwrap().kill(self);
     }
 
     /// Closes a route, frees its entry, and sends down signals to all routes
@@ -351,14 +473,17 @@ impl PostOffice {
             return;
         };
 
-        let address = *address;
-        let post = self.to_owned();
-
         // send down signals asynchronously in order to return in constant time
         // mitigates timing attacks and eliminates delays
-        tokio::spawn(async move {
-            for monitor in monitors {
-                post.send(&monitor, RouteSignal::Down { address }).await;
+        tokio::spawn({
+            // move owned values into the task
+            let address = *address;
+            let post = self.to_owned();
+
+            async move {
+                for monitor in monitors {
+                    post.send(&monitor, RouteSignal::Down { address }).await;
+                }
             }
         });
 
@@ -443,6 +568,24 @@ impl PostOffice {
         }
 
         monitors.insert(*object);
+    }
+
+    /// Links the route group of a given route to a route group.
+    pub(crate) fn link(self: &Arc<Self>, route: &RouteAddress, group: &Arc<RouteGroup>) {
+        let Some(route) = self.get_route(route) else {
+            return;
+        };
+
+        RouteGroup::link(self, route.group.as_ref().unwrap(), group);
+    }
+
+    /// Unlinks the route group of a given route from a route group.
+    pub(crate) fn unlink(self: &Arc<Self>, route: &RouteAddress, group: &Arc<RouteGroup>) {
+        let Some(route) = self.get_route(route) else {
+            return;
+        };
+
+        RouteGroup::unlink(route.group.as_ref().unwrap(), group);
     }
 
     /// Internal helper function to look up a route by address (including generation).
@@ -815,6 +958,71 @@ impl Table {
         Ok(())
     }
 
+    /// Links a mailbox group to the given capability.
+    ///
+    /// When the capability's route group dies, the given mailbox group will
+    /// also be killed. Linking works the other way, too: when the mailbox
+    /// group dies, the capability will also be killed.
+    ///
+    /// If either the mailbox group or the given capability are already dead,
+    /// the other will be killed.
+    ///
+    /// Returns [TableError::PermissionDenied] if the capability does not have
+    /// [Permissions::LINK].
+    ///
+    /// Returns [TableError::TableMismatch] if the mailbox group is using
+    /// a different [Table].
+    ///
+    /// Does nothing if the capability and mailbox group are already linked.
+    pub fn link(&self, handle: CapabilityHandle, group: &MailboxGroup) -> TableResult<()> {
+        if !std::ptr::eq(group.table, self) {
+            return Err(TableError::TableMismatch);
+        }
+
+        let inner = self.inner.lock();
+        let entry = inner
+            .entries
+            .get(handle.0)
+            .ok_or(TableError::InvalidHandle)?;
+
+        if !entry.cap.perms.contains(Permissions::LINK) {
+            return Err(TableError::PermissionDenied);
+        }
+
+        self.post.link(&entry.cap.address, &group.group);
+        Ok(())
+    }
+
+    /// Unlinks a mailbox group from the given capability.
+    ///
+    /// Undoes [Self::link].
+    ///
+    /// Returns [TableError::PermissionDenied] if the capability does not have
+    /// [Permissions::LINK].
+    ///
+    /// Returns [TableError::TableMismatch] if the mailbox group is using
+    /// a different [Table].
+    ///
+    /// Does nothing if the capability and mailbox group are already unlinked.
+    pub fn unlink(&self, handle: CapabilityHandle, group: &MailboxGroup) -> TableResult<()> {
+        if !std::ptr::eq(group.table, self) {
+            return Err(TableError::TableMismatch);
+        }
+
+        let inner = self.inner.lock();
+        let entry = inner
+            .entries
+            .get(handle.0)
+            .ok_or(TableError::InvalidHandle)?;
+
+        if !entry.cap.perms.contains(Permissions::LINK) {
+            return Err(TableError::PermissionDenied);
+        }
+
+        self.post.unlink(&entry.cap.address, &group.group);
+        Ok(())
+    }
+
     /// Sends a message to the given capability handle.
     ///
     /// This function is async because zero-copy sending of signals needs to
@@ -1070,7 +1278,7 @@ pub enum OwnedTableSignal<'a> {
 /// group.
 pub struct MailboxGroup<'a> {
     table: &'a Table,
-    group: Arc<Mutex<RouteGroup>>,
+    group: Arc<RouteGroup>,
 }
 
 impl<'a> MailboxGroup<'a> {
@@ -1078,24 +1286,14 @@ impl<'a> MailboxGroup<'a> {
     pub fn new(table: &'a Table) -> Self {
         Self {
             table,
-            group: Arc::new(Mutex::new(RouteGroup {
-                addresses: HashSet::new(),
-                dead: false,
-            })),
+            group: Arc::new(RouteGroup::default()),
         }
     }
 
     /// Creates a new mailbox. Returns `None` if this mailbox group has been killed.
     pub fn create_mailbox(&self) -> Option<Mailbox<'_>> {
-        let mut group = self.group.lock();
-
-        if group.dead {
-            return None;
-        }
-
         let (tx, rx) = channel();
-        let address = self.table.post.insert(tx, self.group.clone());
-        group.addresses.insert(address);
+        let address = self.table.post.insert(tx, self.group.clone())?;
 
         Some(Mailbox {
             group: self,
@@ -1104,9 +1302,19 @@ impl<'a> MailboxGroup<'a> {
         })
     }
 
+    /// Retrieves this mailbox group's underlying route group.
+    pub fn get_route_group(&self) -> &Arc<RouteGroup> {
+        &self.group
+    }
+
+    /// Kills this mailbox group.
+    pub fn kill(&self) {
+        self.group.kill(&self.table.post);
+    }
+
     /// Checks if this mailbox group has been killed.
     pub fn poll_dead(&self) -> bool {
-        self.group.lock().dead
+        self.group.is_dead()
     }
 }
 

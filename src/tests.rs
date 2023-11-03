@@ -26,7 +26,7 @@ async fn send_message() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.export(Permissions::SEND, &table).unwrap();
+    let ad = mb.export_to(Permissions::SEND, &table).unwrap();
     ad.send(b"Hello world!", &[]).await.unwrap();
 
     assert!(mb
@@ -45,7 +45,7 @@ async fn send_address() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.export(Permissions::SEND, &table).unwrap();
+    let ad = mb.export(Permissions::SEND).unwrap();
     ad.send(b"", &[&ad]).await.unwrap();
 
     assert!(mb
@@ -66,7 +66,7 @@ async fn table_send_impls_send() {
     tokio::spawn(async move {
         let group = MailboxGroup::new(&table);
         let mb = group.create_mailbox().unwrap();
-        let ad = mb.export(Permissions::SEND, &table).unwrap();
+        let ad = mb.export(Permissions::SEND).unwrap();
         ad.send(b"Hello world!", &[]).await.unwrap();
 
         assert!(mb
@@ -91,7 +91,7 @@ async fn try_recv() {
 
     assert_eq!(mb.try_recv(|_| ()), Some(None));
 
-    let ad = mb.export(Permissions::SEND, &table).unwrap();
+    let ad = mb.export(Permissions::SEND).unwrap();
     ad.send(b"Hello world!", &[]).await.unwrap();
 
     assert!(mb
@@ -110,7 +110,7 @@ async fn deny_send() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.export(Permissions::empty(), &table).unwrap();
+    let ad = mb.export(Permissions::empty()).unwrap();
     let result = ad.send(b"", &[]).await;
     assert_eq!(result, Err(TableError::PermissionDenied));
 }
@@ -120,7 +120,7 @@ async fn deny_kill() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.export(Permissions::empty(), &table).unwrap();
+    let ad = mb.export(Permissions::empty()).unwrap();
     let result = ad.kill();
     assert_eq!(result, Err(TableError::PermissionDenied));
 }
@@ -130,7 +130,7 @@ async fn deny_monitor() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.export(Permissions::empty(), &table).unwrap();
+    let ad = mb.export(Permissions::empty()).unwrap();
     let result = ad.monitor(&mb);
     assert_eq!(result, Err(TableError::PermissionDenied));
 }
@@ -140,7 +140,7 @@ async fn deny_demote_escalation() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.export(Permissions::KILL, &table).unwrap();
+    let ad = mb.export(Permissions::KILL).unwrap();
     let result = ad.demote(Permissions::SEND);
     assert_eq!(result.unwrap_err(), TableError::PermissionDenied);
 }
@@ -150,7 +150,7 @@ async fn kill() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.export(Permissions::KILL, &table).unwrap();
+    let ad = mb.export(Permissions::KILL).unwrap();
     ad.kill().unwrap();
     assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
 }
@@ -160,7 +160,7 @@ async fn double_kill() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.export(Permissions::KILL, &table).unwrap();
+    let ad = mb.export(Permissions::KILL).unwrap();
     ad.kill().unwrap();
     ad.kill().unwrap();
     assert_eq!(mb.recv(|s| format!("{:?}", s)).await, None);
@@ -171,7 +171,7 @@ async fn dropped_handles_are_freed() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
-    let ad = mb.export(Permissions::empty(), &table).unwrap();
+    let ad = mb.export(Permissions::empty()).unwrap();
     let handle = ad.handle;
     assert!(table.is_valid(handle));
     drop(ad);
@@ -184,7 +184,7 @@ async fn kill_all_mailboxes() {
     let group = MailboxGroup::new(&table);
     let mb1 = group.create_mailbox().unwrap();
     let mb2 = group.create_mailbox().unwrap();
-    let ad = mb1.export(Permissions::KILL, &table).unwrap();
+    let ad = mb1.export(Permissions::KILL).unwrap();
     ad.kill().unwrap();
     assert_eq!(mb2.recv(|s| format!("{:?}", s)).await, None);
 }
@@ -197,8 +197,8 @@ async fn export_different_table() {
 
     let table2 = Table::new(table1.post.clone());
 
-    let ad1 = mb.export(Permissions::SEND, &table1).unwrap().to_owned();
-    let ad2 = mb.export(Permissions::SEND, &table2).unwrap().to_owned();
+    let ad1 = mb.export_to(Permissions::SEND, &table1).unwrap().to_owned();
+    let ad2 = mb.export_to(Permissions::SEND, &table2).unwrap().to_owned();
 
     assert_eq!(ad1, ad2);
 }
@@ -237,7 +237,7 @@ async fn down_on_close() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let s_mb = group.create_mailbox().unwrap();
-    let s_cap = s_mb.export(Permissions::MONITOR, &table).unwrap();
+    let s_cap = s_mb.export(Permissions::MONITOR).unwrap();
     let object = group.create_mailbox().unwrap();
     s_cap.monitor(&object).unwrap();
     drop(s_mb);
@@ -283,7 +283,7 @@ async fn down_closed() {
     let table = Table::default();
     let group = MailboxGroup::new(&table);
     let s_mb = group.create_mailbox().unwrap();
-    let s_cap = s_mb.export(Permissions::MONITOR, &table).unwrap();
+    let s_cap = s_mb.export(Permissions::MONITOR).unwrap();
     let object = group.create_mailbox().unwrap();
     drop(s_mb);
     s_cap.monitor(&object).unwrap();

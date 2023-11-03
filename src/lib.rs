@@ -1411,8 +1411,8 @@ impl<'a> Mailbox<'a> {
         }
     }
 
-    /// Exports a [CapabilityRef] to a [Table]
-    pub fn export<'b>(
+    /// Exports a [CapabilityRef] to a [Table].
+    pub fn export_to<'b>(
         &self,
         perms: Permissions,
         table: &'b Table,
@@ -1427,6 +1427,11 @@ impl<'a> Mailbox<'a> {
         });
 
         Ok(CapabilityRef { table, handle })
+    }
+
+    /// Exports a [CapabilityRef] to the current mailbox's [Table].
+    pub fn export(&self, perms: Permissions) -> TableResult<CapabilityRef<'a>> {
+        self.export_to(perms, self.group.table)
     }
 
     /// Exports an [OwnedCapability] from this mailbox.

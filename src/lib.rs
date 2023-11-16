@@ -822,7 +822,8 @@ impl Table {
             .get(cap.handle.0)
             .ok_or(TableError::InvalidHandle)?
             .cap;
-        self.wrap_handle(self.inner.lock().import(capability))
+        let capability = self.inner.lock().import(capability);
+        self.wrap_handle(capability)
     }
 
     /// Imports a table-less [Signal] to a table-local [ContextSignal].

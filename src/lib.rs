@@ -726,7 +726,7 @@ impl TableInner {
 /// should manually call [Table::inc_ref] and [Table::dec_ref] for the lifetime
 /// of this type. If you're looking for a friendlier capability API, check out
 /// [CapabilityRef].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct CapabilityHandle(pub usize);
 
 /// Contains unforgeable capabilities, performs operations on them, and moderates

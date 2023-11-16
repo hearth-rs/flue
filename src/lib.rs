@@ -810,7 +810,7 @@ impl Table {
     /// Import a [CapabilityRef] from any table directly into this table.
     ///
     /// Returns [TableError::PostOfficeMismatch] if the capability has different [PostOffice].
-    pub fn import_ref<'a>(&self, cap: CapabilityRef<'a>) -> TableResult<CapabilityRef<'_>> {
+    pub fn import_ref(&self, cap: CapabilityRef<'_>) -> TableResult<CapabilityRef<'_>> {
         if !Arc::ptr_eq(&self.post, &cap.table.post) {
             return Err(TableError::PostOfficeMismatch);
         }

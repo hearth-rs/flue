@@ -807,6 +807,24 @@ impl Table {
         self.inner.lock().import(cap)
     }
 
+    /// Import a [CapabilityRef] directly into this table.
+    ///
+    /// Returns [TableError::PostOfficeMismatch] if the capability has different [PostOffice].
+    pub fn import_ref<'a>(&self, cap: CapabilityRef<'a>) -> TableResult<CapabilityRef<'_>> {
+        if !Arc::ptr_eq(&self.post, &cap.table.post) {
+            return Err(TableError::PostOfficeMismatch);
+        }
+        let capability = cap
+            .table
+            .inner
+            .lock()
+            .entries
+            .get(cap.handle.0)
+            .ok_or(TableError::InvalidHandle)?
+            .cap;
+        self.wrap_handle(self.inner.lock().import(capability))
+    }
+
     /// Imports a table-less [Signal] to a table-local [ContextSignal].
     pub(crate) fn map_signal<'a>(&self, signal: RouteSignal<'a>) -> TableSignal<'a> {
         match signal {

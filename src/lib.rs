@@ -807,7 +807,7 @@ impl Table {
         self.inner.lock().import(cap)
     }
 
-    /// Import a [CapabilityRef] directly into this table.
+    /// Import a [CapabilityRef] from any table directly into this table.
     ///
     /// Returns [TableError::PostOfficeMismatch] if the capability has different [PostOffice].
     pub fn import_ref<'a>(&self, cap: CapabilityRef<'a>) -> TableResult<CapabilityRef<'_>> {

@@ -204,6 +204,30 @@ async fn export_different_table() {
 }
 
 #[tokio::test]
+async fn import_ref() {
+    let table = Table::default();
+    let group = MailboxGroup::new(&table);
+    let mb = group.create_mailbox().unwrap();
+
+    let cap1 = mb.export(Permissions::SEND, &table).unwrap();
+    let cap2 = table.import_ref(cap1.clone()).unwrap();
+    assert_eq!(cap1.to_owned(), cap2.to_owned());
+}
+
+#[tokio::test]
+async fn import_ref_different_table() {
+    let table1 = Table::default();
+    let group = MailboxGroup::new(&table1);
+    let mb = group.create_mailbox().unwrap();
+
+    let table2 = table1.spawn();
+    let cap1 = mb.export(Permissions::SEND, &table1).unwrap();
+    let cap2 = table2.import_ref(cap1.clone()).unwrap();
+
+    assert_eq!(cap1.to_owned(), cap2.to_owned());
+}
+
+#[tokio::test]
 async fn down_on_kill() {
     let table = Table::default();
     let o_group = MailboxGroup::new(&table);

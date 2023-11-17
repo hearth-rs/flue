@@ -209,7 +209,7 @@ async fn import_ref() {
     let group = MailboxGroup::new(&table);
     let mb = group.create_mailbox().unwrap();
 
-    let cap1 = mb.export(Permissions::SEND, &table).unwrap();
+    let cap1 = mb.export_to(Permissions::SEND, &table).unwrap();
     let cap2 = table.import_ref(cap1.clone()).unwrap();
     assert_eq!(cap1.to_owned(), cap2.to_owned());
 }
@@ -221,7 +221,7 @@ async fn import_ref_different_table() {
     let mb = group.create_mailbox().unwrap();
 
     let table2 = table1.spawn();
-    let cap1 = mb.export(Permissions::SEND, &table1).unwrap();
+    let cap1 = mb.export_to(Permissions::SEND, &table1).unwrap();
     let cap2 = table2.import_ref(cap1.clone()).unwrap();
 
     assert_eq!(cap1.to_owned(), cap2.to_owned());

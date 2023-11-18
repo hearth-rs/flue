@@ -366,7 +366,7 @@ impl Default for Route {
         Self {
             tx: None,
             group: None,
-            monitors: Mutex::new(Some(HashSet::new())),
+            monitors: Mutex::new(None),
             generation: 0,
         }
     }
@@ -445,6 +445,7 @@ impl PostOffice {
         // initialize the route entry
         route.tx = Some(tx);
         route.group = Some(group);
+        *route.monitors.lock() = Some(HashSet::new());
 
         // return the new address
         Some(address)

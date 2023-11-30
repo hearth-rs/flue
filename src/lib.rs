@@ -308,7 +308,14 @@ impl RouteGroup {
     /// Unlinks two linked route groups.
     ///
     /// Does nothing if the two groups are not linked.
+    ///
+    /// Does nothing if the the two arguments are the same route group.
     pub fn unlink(a: &Arc<Self>, b: &Arc<Self>) {
+        // check that the groups are not the same
+        if Arc::ptr_eq(a, b) {
+            return;
+        }
+
         // lock both groups simultaneously
         let mut a_inner = a.inner.lock();
         let mut b_inner = b.inner.lock();
